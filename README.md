@@ -1,9 +1,9 @@
 # Logseq Graph MCP
 
-[![npm version](https://img.shields.io/npm/v/logseq-graph-mcp.svg)](https://www.npmjs.com/package/logseq-graph-mcp)
+[![version](https://img.shields.io/badge/version-0.1.0-brightgreen.svg)](package.json)
 [![CI](https://github.com/johnschieferleuhlenbrock/logseq-graph-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/johnschieferleuhlenbrock/logseq-graph-mcp/actions/workflows/ci.yml)
-[![license](https://img.shields.io/npm/l/logseq-graph-mcp.svg)](LICENSE)
-[![node](https://img.shields.io/node/v/logseq-graph-mcp.svg)](package.json)
+[![license](https://img.shields.io/github/license/johnschieferleuhlenbrock/logseq-graph-mcp?color=brightgreen)](LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D20.17.0-brightgreen.svg)](package.json)
 
 Local-only stdio MCP server for safe agent access to Logseq markdown graphs.
 
