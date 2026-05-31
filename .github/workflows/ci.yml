@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  public-release:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Public-safety scan
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const roots = ["."];
+          const ignoredDirs = new Set([".git", "node_modules"]);
+          const ignoredFiles = new Set(["pack.json"]);
+          const deny = [
+            ["absolute user home path", new RegExp("/" + "Users" + "/[^/\\s]+")],
+            ["cloud-storage local path", new RegExp("Library/" + "CloudStorage|" + "One" + "Drive-Personal")],
+            ["workspace-local project path", new RegExp("Claude/" + "projects")],
+            ["personal username", new RegExp("jo" + "hnsu", "i")],
+            ["private key material", new RegExp("BEGIN " + "(RSA |OPENSSH |EC |DSA )?PRIVATE KEY")],
+            ["likely OpenAI API key", new RegExp("sk-" + "[A-Za-z0-9_-]{20,}")],
+          ];
+
+          function files(root) {
+            if (!fs.existsSync(root)) return [];
+            const stat = fs.statSync(root);
+            if (stat.isFile()) return ignoredFiles.has(path.basename(root)) ? [] : [root];
+            return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+              if (entry.isDirectory() && ignoredDirs.has(entry.name)) return [];
+              const child = path.join(root, entry.name);
+              return entry.isDirectory() ? files(child) : [child];
+            });
+          }
+
+          const findings = [];
+          for (const file of roots.flatMap(files)) {
+            const text = fs.readFileSync(file, "utf8");
+            for (const [label, pattern] of deny) {
+              if (pattern.test(text)) findings.push(`${file}: ${label}`);
+            }
+          }
+          if (findings.length) {
+            console.error(findings.join("\n"));
+            process.exit(1);
+          }
+          NODE
+      - name: Validate packed release contents
+        run: |
+          npm pack --dry-run --json --ignore-scripts > pack.json
+          node <<'NODE'
+          const fs = require("node:fs");
+          const pack = JSON.parse(fs.readFileSync("pack.json", "utf8"))[0];
+          const files = pack.files.map((entry) => entry.path).sort();
+          const required = ["package.json", "README.md", "LICENSE", "SECURITY.md", "dist/index.js", "dist/logseq.js"];
+          const missing = required.filter((file) => !files.includes(file));
+          const forbidden = files.filter((file) => /^(src|tests|\.github|node_modules)\//.test(file));
+          if (missing.length || forbidden.length) {
+            console.error(JSON.stringify({ missing, forbidden }, null, 2));
+            process.exit(1);
+          }
+          NODE
+      - name: Validate package executable
+        run: |
+          node <<'NODE'
+          const childProcess = require("node:child_process");
+          const pkg = require("./package.json");
+          childProcess.execFileSync(process.execPath, [pkg.bin["logseq-graph-mcp"], "--help"], { stdio: "inherit" });
+          NODE

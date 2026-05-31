@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "logseq": {
+      "command": "npx",
+      "args": ["logseq-graph-mcp", "--root", "/path/to/logseq-graph"],
+      "env": {
+        "LOGSEQ_READONLY": "1",
+        "LOGSEQ_WATCH": "0"
+      }
+    }
+  }
+}

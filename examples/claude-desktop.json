@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "logseq": {
+      "command": "npx",
+      "args": ["logseq-graph-mcp", "--root", "/path/to/logseq-graph"],
+      "env": {
+        "LOGSEQ_GIT_GUARD": "strict"
+      }
+    }
+  }
+}
