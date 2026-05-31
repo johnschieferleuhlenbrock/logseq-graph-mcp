@@ -1,6 +1,7 @@
 import readline from "node:readline";
 import { stdin, stdout } from "node:process";
 import { LogseqServer } from "./logseq.js";
+import { packageName, packageVersion } from "./package-info.js";
 
 type JsonRpcRequest = {
   jsonrpc?: string;
@@ -44,7 +45,7 @@ export async function runStdioServer(server = new LogseqServer()): Promise<void>
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "logseq-graph-mcp", version: "0.1.0" },
+            serverInfo: { name: packageName, version: packageVersion },
             instructions: "Local-only stdio MCP server for safe access to a Logseq markdown graph.",
           },
         });

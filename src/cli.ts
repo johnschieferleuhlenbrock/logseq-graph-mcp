@@ -1,13 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { LogseqServer } from "./logseq.js";
+import { packageVersion } from "./package-info.js";
 import { runStdioServer } from "./server.js";
-
-const require = createRequire(import.meta.url);
-const packageJson = require("../package.json") as { name?: string; version?: string; description?: string };
 
 const USAGE_EXIT = 64;
 const CONFIG_EXIT = 78;
@@ -117,7 +114,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   if (options.version) {
-    process.stdout.write(`${packageJson.version ?? "0.0.0"}\n`);
+    process.stdout.write(`${packageVersion}\n`);
     return;
   }
 
@@ -135,5 +132,5 @@ if (isDirectRun()) {
   });
 }
 
-export const version = packageJson.version ?? "0.0.0";
+export const version = packageVersion;
 export { LogseqServer, runStdioServer };

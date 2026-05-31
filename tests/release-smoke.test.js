@@ -7,6 +7,7 @@ import test from "node:test";
 import { makeGraph, repo, status } from "./helpers/logseq-fixtures.js";
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+const expectedPackageVersion = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")).version;
 const localLeakPatterns = [
   ["absolute user home path", new RegExp("/" + "Users" + "/[^/\\s\"'`)]+")],
   ["cloud-storage local path", new RegExp("Library/" + "CloudStorage|" + "One" + "Drive-Personal")],
@@ -89,7 +90,7 @@ test("package tarball installs, imports, and exposes the CLI bin", () => {
     const bin = path.join(installDir, "node_modules", ".bin", process.platform === "win32" ? "logseq-graph-mcp.cmd" : "logseq-graph-mcp");
     assert.equal(fs.existsSync(bin), true);
     const version = runOk(bin, ["--version"], { cwd: installDir });
-    assert.equal(version.stdout.trim(), "0.1.0");
+    assert.equal(version.stdout.trim(), expectedPackageVersion);
     const help = runOk(bin, ["--help"], { cwd: installDir });
     assert.match(help.stdout, /Usage: logseq-graph-mcp --root/);
 
@@ -99,7 +100,7 @@ test("package tarball installs, imports, and exposes the CLI bin", () => {
       console.log(JSON.stringify({ version, hasTools: Object.keys(s.tools()).includes("graph_status") }));
       s.close();
     `], { cwd: installDir });
-    assert.deepEqual(JSON.parse(importCheck.stdout), { version: "0.1.0", hasTools: true });
+    assert.deepEqual(JSON.parse(importCheck.stdout), { version: expectedPackageVersion, hasTools: true });
   } finally {
     fs.rmSync(packDir, { recursive: true, force: true });
     fs.rmSync(installDir, { recursive: true, force: true });
@@ -131,6 +132,8 @@ test("installed stdio server initializes, lists tools, and blocks readonly write
       timeout: 20000,
     });
     const responses = parseJsonLines(res.stdout);
+    const initialize = responses.find((entry) => entry.id === 1).result;
+    assert.deepEqual(initialize.serverInfo, { name: "logseq-graph-mcp", version: expectedPackageVersion });
     const tools = responses.find((entry) => entry.id === 2).result.tools.map((tool) => tool.name);
     assert.equal(tools.includes("graph_status"), true);
     assert.equal(tools.includes("create_stub"), true);

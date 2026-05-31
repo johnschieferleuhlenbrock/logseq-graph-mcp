@@ -573,6 +573,10 @@ test("stdio MCP initialize, tools/list, readonly write call", () => {
   });
   assert.equal(res.status, 0, res.stderr);
   const responses = res.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(responses.find((entry) => entry.id === 1).result.serverInfo, {
+    name: "logseq-graph-mcp",
+    version: pkg.version,
+  });
   assert.match(JSON.stringify(responses), /graph_status/);
   assert.match(JSON.stringify(responses), /create_stub/);
   assert.match(res.stderr, /readonly = True/);
