@@ -125,13 +125,20 @@ test("update --channel is reflected in install guidance for mutable installs and
   assert.equal(npxReport.detail, "npx runs are ephemeral. Run: npx logseq-graph-mcp@next");
 });
 
+test("maintenance parser rejects ambiguous update modes and empty root values", async () => {
+  const { parseMaintenanceArgs } = await import("../dist/cli-maintenance.js");
+  assert.equal(parseMaintenanceArgs(["update", "--channel=beta"]).check, true);
+  assert.throws(() => parseMaintenanceArgs(["update", "--apply", "--dry-run"]), /only one/);
+  assert.throws(() => parseMaintenanceArgs(["doctor", "--root="]), /Missing value/);
+});
+
 test("update --apply installs the selected channel when mutation is allowed", async () => {
   const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "logseq-mcp-fake-npm-"));
   const argsFile = path.join(fakeBin, "npm-args.json");
   const npmShim = path.join(fakeBin, process.platform === "win32" ? "npm.cmd" : "npm");
   const shimSource = process.platform === "win32"
-    ? `@echo off\r\nnode -e "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))" "${argsFile}" %*\r\n`
-    : `#!/usr/bin/env sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' '${argsFile}' "$@"\n`;
+    ? `@echo off\r\necho npm progress should not pollute json\r\nnode -e "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))" "${argsFile}" %*\r\n`
+    : `#!/usr/bin/env sh\nprintf 'npm progress should not pollute json\\n'\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' '${argsFile}' "$@"\n`;
   fs.writeFileSync(npmShim, shimSource, "utf8");
   fs.chmodSync(npmShim, 0o755);
   try {

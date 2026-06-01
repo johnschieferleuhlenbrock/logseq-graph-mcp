@@ -62,10 +62,14 @@ export function parseMaintenanceArgs(argv: string[]): MaintenanceOptions {
       index += 1;
     } else if (arg.startsWith("--root=")) {
       options.root = arg.slice("--root=".length);
+      if (!options.root) throw new Error("Missing value for --root.");
     } else {
       throw new Error(`Unknown ${command} option: ${arg}`);
     }
   }
+  const modeFlags = [options.apply, options.check, options.dryRun].filter(Boolean).length;
+  if (modeFlags > 1) throw new Error("Use only one of --check, --dry-run, or --apply.");
+  if (!modeFlags) options.check = true;
 
   return options;
 }
@@ -93,7 +97,7 @@ export function runDoctor({
   root?: string;
   json: boolean;
   env?: NodeJS.ProcessEnv;
-  stdout?: NodeJS.WriteStream;
+  stdout?: NodeJS.WritableStream;
 }): number {
   const packageJson = readPackageJson(packageRoot);
   const install = detectInstallMode({ packageName: packageJson.name, packageRoot, modulePath, env });
@@ -128,8 +132,8 @@ export function runUpdate({
   modulePath: string;
   options: MaintenanceOptions;
   env?: NodeJS.ProcessEnv;
-  stdout?: NodeJS.WriteStream;
-  stderr?: NodeJS.WriteStream;
+  stdout?: NodeJS.WritableStream;
+  stderr?: NodeJS.WritableStream;
 }): number {
   const packageJson = readPackageJson(packageRoot);
   const install = detectInstallMode({ packageName: packageJson.name, packageRoot, modulePath, env });
@@ -151,7 +155,7 @@ export function runUpdate({
 
   if (options.apply) {
     report.action = "apply";
-    const apply = applyUpdate({ packageName: packageJson.name, channel: options.channel, install, env });
+    const apply = applyUpdate({ packageName: packageJson.name, channel: options.channel, install, json: options.json, env });
     report.ok = apply.ok;
     report.applied = apply.applied;
     report.detail = apply.detail;
@@ -216,11 +220,13 @@ function applyUpdate({
   packageName,
   channel,
   install,
+  json,
   env,
 }: {
   packageName: string;
   channel: string;
   install: InstallMode;
+  json: boolean;
   env: NodeJS.ProcessEnv;
 }): { ok: boolean; applied: boolean; detail: string } {
   const target = `${packageName}@${channel}`;
@@ -239,7 +245,7 @@ function applyUpdate({
   }
   try {
     const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-    execFileSync(npm, ["install", "-g", target], { env, stdio: "inherit", timeout: 120000 });
+    execFileSync(npm, ["install", "-g", target], { env, stdio: json ? ["ignore", "pipe", "pipe"] : "inherit", timeout: 120000 });
     return { ok: true, applied: true, detail: `Updated ${target} with npm install -g.` };
   } catch (error) {
     return { ok: false, applied: false, detail: `npm install -g failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -279,7 +285,7 @@ function checkBuild(packageRoot: string): { name: string; ok: boolean; detail: s
   return { name: "build", ok, detail: ok ? "dist/cli.js found" : "dist/cli.js missing; run npm run build before using the packaged CLI" };
 }
 
-function writeReport(report: Record<string, unknown>, json: boolean, stream: NodeJS.WriteStream, formatter: (report: Record<string, unknown>) => string): void {
+function writeReport(report: Record<string, unknown>, json: boolean, stream: NodeJS.WritableStream, formatter: (report: Record<string, unknown>) => string): void {
   if (json) stream.write(`${JSON.stringify(report, null, 2)}\n`);
   else stream.write(formatter(report));
 }
