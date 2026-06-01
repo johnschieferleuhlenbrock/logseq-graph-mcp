@@ -245,7 +245,7 @@ function applyUpdate({
   }
   try {
     const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-    execFileSync(npm, ["install", "-g", target], { env, stdio: json ? ["ignore", "pipe", "pipe"] : "inherit", timeout: 120000 });
+    execFileSync(npm, ["install", "-g", target], { env, stdio: json ? "ignore" : "inherit", timeout: 120000 });
     return { ok: true, applied: true, detail: `Updated ${target} with npm install -g.` };
   } catch (error) {
     return { ok: false, applied: false, detail: `npm install -g failed: ${error instanceof Error ? error.message : String(error)}` };
