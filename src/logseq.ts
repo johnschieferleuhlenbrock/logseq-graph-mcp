@@ -396,7 +396,7 @@ export class LogseqServer {
 
   private git(args: string[], timeoutMs = 30000): { status: number | null; stdout: string; stderr: string } {
     const command = args[0];
-    const allowed = new Set(["rev-parse", "log", "status", "add", "commit", "reset", "clean"]);
+    const allowed = new Set(["rev-parse", "log", "status", "add", "commit", "reset", "restore", "clean"]);
     if (!command || !allowed.has(command)) {
       throw new GitGuardError(`git subcommand is not allowed: ${command ?? ""}`);
     }
@@ -448,7 +448,7 @@ export class LogseqServer {
   }
 
   gitStatusEntries(): StatusEntry[] {
-    const r = this.git(["status", "--porcelain=v1", "-z"], 20000);
+    const r = this.git(["status", "--porcelain=v1", "--untracked-files=all", "-z"], 20000);
     if (r.status !== 0) {
       throw new GitGuardError("git status failed", {
         returncode: r.status,
@@ -1461,7 +1461,7 @@ export class LogseqServer {
     if (!this.under(archivePath, path.join(this.root, "archive"))) return this.err("archive path escapes archive dir");
     let txn: GitTxn;
     try {
-      txn = this.beginTxn("delete_page", 2, 1);
+      txn = this.beginTxn("delete_page", 3, 1);
     } catch (e) {
       return this.err((e as Error).message, { git_guard: (e as GitGuardError).payload });
     }

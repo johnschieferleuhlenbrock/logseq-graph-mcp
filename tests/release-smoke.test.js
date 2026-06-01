@@ -93,6 +93,23 @@ test("package tarball installs, imports, and exposes the CLI bin", () => {
     assert.equal(version.stdout.trim(), expectedPackageVersion);
     const help = runOk(bin, ["--help"], { cwd: installDir });
     assert.match(help.stdout, /Usage: logseq-graph-mcp --root/);
+    assert.match(help.stdout, /logseq-graph-mcp doctor/);
+    const doctor = runOk(bin, ["doctor", "--json"], {
+      cwd: installDir,
+      env: { ...process.env, LOGSEQ_UPDATE_SKIP_NETWORK: "1" },
+    });
+    const doctorReport = JSON.parse(doctor.stdout);
+    assert.equal(doctorReport.package, "logseq-graph-mcp");
+    assert.equal(doctorReport.command, "logseq-graph-mcp");
+    const update = runOk(bin, ["update", "--check", "--channel", "beta", "--json"], {
+      cwd: installDir,
+      env: { ...process.env, LOGSEQ_UPDATE_LATEST_VERSION: "99.0.0" },
+    });
+    const updateReport = JSON.parse(update.stdout);
+    assert.equal(updateReport.package, "logseq-graph-mcp");
+    assert.equal(updateReport.channel, "beta");
+    assert.equal(updateReport.outdated, true);
+    assert.equal(updateReport.next, "npm install -g logseq-graph-mcp@beta");
 
     const importCheck = runOk(process.execPath, ["--input-type=module", "-e", `
       import { LogseqServer, version } from "logseq-graph-mcp";

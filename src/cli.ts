@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { maintenanceUsage, parseMaintenanceArgs, runDoctor, runUpdate } from "./cli-maintenance.js";
 import { LogseqServer } from "./logseq.js";
 import { packageVersion } from "./package-info.js";
 import { runStdioServer } from "./server.js";
@@ -39,6 +40,8 @@ Optional runtime integrations:
   re2 is used for safer regex searches when installed; native RegExp is used otherwise.
   git is required only when LOGSEQ_GIT_GUARD=strict or warn.
   python3 is required only when LOGSEQ_ALLOW_EXTERNAL_REGEN=1 and the graph supplies scripts/regenerate_graph_index.py.
+
+${maintenanceUsage("logseq-graph-mcp")}
 `;
 }
 
@@ -106,6 +109,20 @@ function isDirectRun(): boolean {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === "doctor" || argv[0] === "update") {
+    const maintenanceOptions = parseMaintenanceArgs(argv);
+    if (maintenanceOptions.help) {
+      process.stdout.write(maintenanceUsage("logseq-graph-mcp"));
+      return;
+    }
+    const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const modulePath = fileURLToPath(import.meta.url);
+    process.exitCode = maintenanceOptions.command === "doctor"
+      ? runDoctor({ packageRoot, modulePath, root: maintenanceOptions.root, json: maintenanceOptions.json })
+      : runUpdate({ packageRoot, modulePath, options: maintenanceOptions });
+    return;
+  }
+
   const options = parseArgs(argv);
 
   if (options.help) {
