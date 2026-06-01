@@ -207,11 +207,27 @@ test("git guard blocks dirty graph before write and commits clean writes", () =>
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("blast radius violation is reported after checkpoint", () => {
+test("strict git guard refuses oversized writes before checkpoint commit", () => {
   const root = makeGraph();
+  const before = run("git", ["rev-parse", "HEAD"], root);
   const res = server(root, { LOGSEQ_GIT_MAX_CHANGED_FILES: "1" }).update_property({ name: "Alice", key: "status", value: "dormant" });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /blast-radius|files changed/);
+  assert.match(res.git_guard.violation, /blast-radius|files changed/);
+  assert.equal(res.git_guard.commit, null);
+  assert.equal(run("git", ["rev-parse", "HEAD"], root), before);
+  assert.match(run("git", ["log", "-1", "--format=%s"], root), /^baseline$/);
+  assert.equal(status(root), "");
+  assert.match(fs.readFileSync(path.join(root, "pages", "Alice.md"), "utf8"), /status:: active/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("warn git guard reports oversized writes after checkpoint", () => {
+  const root = makeGraph();
+  const res = server(root, { LOGSEQ_GIT_GUARD: "warn", LOGSEQ_GIT_MAX_CHANGED_FILES: "1" }).update_property({ name: "Alice", key: "status", value: "dormant" });
   assert.equal(res.ok, true);
   assert.match(res.git_guard.violation, /blast-radius|files changed/);
+  assert.ok(res.git_guard.commit);
   assert.equal(status(root), "");
   fs.rmSync(root, { recursive: true, force: true });
 });

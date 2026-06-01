@@ -40,6 +40,25 @@ After publication, the intended one-shot form is:
 npx logseq-graph-mcp --root /path/to/logseq-graph
 ```
 
+## Maintenance Commands
+
+The MCP CLI and Living Atlas CLI share the same maintenance shape:
+
+```sh
+logseq-graph-mcp doctor [--root /path/to/logseq-graph] [--json]
+logseq-graph-mcp update [--check|--dry-run|--apply] [--channel latest] [--json]
+```
+
+`doctor` validates the local runtime, package metadata, install mode, built CLI, and optional graph root.
+
+`update` checks npm release metadata for the selected channel and prints install-mode-aware guidance:
+
+- source checkout: `git pull && npm install && npm run check`
+- npx execution: `npx logseq-graph-mcp@<channel>`
+- npm package install: `npm install -g logseq-graph-mcp@<channel>`
+
+Actual mutation requires `update --apply` plus `LOGSEQ_UPDATE_ALLOW_APPLY=1`. Source checkouts and npx runs refuse in-place mutation.
+
 ## Client Configuration
 
 Ready-to-edit examples are available under `examples/` for Codex, ChatGPT, and
@@ -121,7 +140,7 @@ and authorization layer.
 - `LOGSEQ_VALIDATE_SCHEMA=block|warn|off` controls property-key validation.
 - `LOGSEQ_DISALLOW_FORCE=1` rejects forced schema bypasses.
 - `LOGSEQ_VALIDATE_LINKS=block|warn|off` controls dangling wikilink validation.
-- `LOGSEQ_GIT_GUARD=strict|warn|off` controls clean-tree checks and checkpoint commits.
+- `LOGSEQ_GIT_GUARD=strict|warn|off` controls clean-tree checks, blast-radius enforcement, and checkpoint commits.
 - Writes use lockfiles plus atomic temp-file replacement.
 - Writes re-read target files inside the lock before mutating.
 - Mutations are append-style or property-level where possible.
@@ -155,9 +174,9 @@ Proceed only when the reported Git state and generated-index state are expected.
 | `LOGSEQ_VALIDATE_SCHEMA` | `block` | `block`, `warn`, or `off` |
 | `LOGSEQ_DISALLOW_FORCE` | unset | Set `1` to reject force bypass |
 | `LOGSEQ_VALIDATE_LINKS` | `block` | `block`, `warn`, or `off` |
-| `LOGSEQ_GIT_GUARD` | `strict` | `strict`, `warn`, or `off` |
-| `LOGSEQ_GIT_MAX_CHANGED_FILES` | `25` | Maximum changed files allowed per guarded write |
-| `LOGSEQ_GIT_MAX_DELETED_FILES` | `0` | Maximum deleted files allowed per guarded write |
+| `LOGSEQ_GIT_GUARD` | `strict` | `strict` blocks dirty or oversized writes before checkpoint commits; `warn` logs violations and still checkpoints; `off` disables the guard |
+| `LOGSEQ_GIT_MAX_CHANGED_FILES` | `25` | Maximum changed files allowed per guarded write; strict blocks, warn logs and checkpoints |
+| `LOGSEQ_GIT_MAX_DELETED_FILES` | `0` | Maximum deleted files allowed per guarded write; strict blocks, warn logs and checkpoints |
 | `LOGSEQ_GIT_COMMIT_AUTHOR` | local MCP guard author | Author for checkpoint commits |
 | `LOGSEQ_GIT_GUARD_IGNORE_DIRS` | unset | Comma-separated top-level guard ignores |
 | `LOGSEQ_CACHE_DIR` | `~/.cache/logseq-mcp` | Persistent frontmatter and adjacency cache directory |
@@ -187,8 +206,10 @@ git -C /path/to/logseq-graph revert <commit>
 ```
 
 Prefer `git revert` for normal recovery because it preserves history. When a
-guard violation is reported, the response also includes `before_head`, `commit`,
-`txn_id`, and a `rollback_hint` for emergency reset workflows.
+strict-mode guard violation is reported, the response includes `before_head`,
+`commit: null`, `changed_files`, `txn_id`, and a `rollback_hint` for emergency
+reset workflows. In warn mode, oversized writes still create a checkpoint commit
+and record the warning in the commit metadata.
 
 ## Development
 

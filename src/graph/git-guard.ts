@@ -94,9 +94,18 @@ export class GitTxn {
       this.changed = this.server.gitStatusEntries();
       if (!this.changed.length) return;
       const deleted = this.changed.filter((e) => e.status.includes("D"));
-      if (this.changed.length > this.maxChangedFiles) this.violation = `Git guard blast-radius violation: ${this.changed.length} files changed (limit ${this.maxChangedFiles})`;
-      if (deleted.length > this.maxDeletedFiles) this.violation = `Git guard delete violation: ${deleted.length} files deleted (limit ${this.maxDeletedFiles})`;
+      const violations: string[] = [];
+      if (this.changed.length > this.maxChangedFiles) violations.push(`Git guard blast-radius violation: ${this.changed.length} files changed (limit ${this.maxChangedFiles})`);
+      if (deleted.length > this.maxDeletedFiles) violations.push(`Git guard delete violation: ${deleted.length} files deleted (limit ${this.maxDeletedFiles})`);
       const pathspecs = Array.from(new Set(this.changed.flatMap((e) => [e.path, e.old_path]).filter(Boolean))).sort();
+      if (violations.length) {
+        this.violation = violations.join("; ");
+        if (this.server.gitGuardMode !== "warn") {
+          this.rollbackChanged(this.changed);
+          throw new GitGuardError(this.violation, this.payload());
+        }
+        console.error(`[logseq-mcp] git guard warning: ${this.violation} ${JSON.stringify(this.payload())}`);
+      }
       this.server.gitOk(["add", "-A", "--", ...pathspecs], 60000);
       const subject = `mcp-logseq: ${this.tool} ${this.txnId}`;
       const messageArgs = [
@@ -128,6 +137,19 @@ export class GitTxn {
       this.lock.release();
       this.lock = null;
     }
+  }
+
+  private rollbackChanged(entries: StatusEntry[]): void {
+    const tracked = Array.from(new Set(entries
+      .filter((entry) => entry.status !== "??")
+      .flatMap((entry) => [entry.path, entry.old_path])
+      .filter(Boolean))).sort();
+    const untracked = Array.from(new Set(entries
+      .filter((entry) => entry.status === "??")
+      .map((entry) => entry.path)
+      .filter(Boolean))).sort();
+    if (tracked.length) this.server.gitOk(["restore", "--source", this.beforeHead || "HEAD", "--", ...tracked], 60000);
+    if (untracked.length) this.server.gitOk(["clean", "-f", "--", ...untracked], 60000);
   }
 
   payload(): Record<string, unknown> {
