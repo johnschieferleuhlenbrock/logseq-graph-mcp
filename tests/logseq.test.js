@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -38,6 +39,11 @@ function installFakeDate(iso) {
   return () => {
     globalThis.Date = RealDate;
   };
+}
+
+function hashFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
 function assertStrictObjectSchemas(schema, label) {
@@ -293,6 +299,7 @@ test("safe write intents are idempotent and flush through git guard", () => {
   assert.equal(submit.ok, true);
   const intentId = submit.intent.intent_id;
   assert.equal(submit.intent.state, "pending");
+  assert.equal(submit.intent.idempotency_key, "test:update-alice-status");
 
   const duplicate = s.callTool("submit_write_intent", {
     idempotency_key: "test:update-alice-status",
@@ -303,6 +310,7 @@ test("safe write intents are idempotent and flush through git guard", () => {
   assert.equal(duplicate.ok, true);
   assert.equal(duplicate.duplicate, true);
   assert.equal(duplicate.intent.intent_id, intentId);
+  assert.equal(duplicate.intent.idempotency_key, "test:update-alice-status");
 
   const conflict = s.callTool("submit_write_intent", {
     idempotency_key: "test:update-alice-status",
@@ -1066,6 +1074,12 @@ test("startup reconciliation commits expected file effects after crash before co
   assert.equal(submit.ok, true);
   s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
   fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: recovered\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  const effectsAfter = s.writeLedger.effects(submit.intent.intent_id).map((effect) => ({
+    ...effect,
+    after_hash: hashFile(path.join(root, effect.path)),
+  }));
+  const applying = s.writeLedger.get(submit.intent.intent_id);
+  s.writeLedger.markAppliedUncommitted(applying, effectsAfter);
   s.close();
 
   const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
@@ -1077,6 +1091,29 @@ test("startup reconciliation commits expected file effects after crash before co
   const body = run("git", ["log", "-1", "--format=%B"], root);
   assert.match(body, /reconciled: true/);
   assert.match(body, /op_id:/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation refuses unproven same-file dirty recovery", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-file-effect-with-extra-drift",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: recovered\nlast-contacted:: 2026-05-01\npriority:: high\n\n- hello\n- unrelated dirty edit\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "manual_review");
+  assert.equal(recovered.read_page("Alice").properties.status, "recovered");
+  assert.match(status(root), /pages\/Alice\.md/);
   recovered.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1093,6 +1130,11 @@ test("startup reconciliation commits recovered delete_property effects", () => {
   assert.equal(submit.ok, true);
   s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
   fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  const effectsAfter = s.writeLedger.effects(submit.intent.intent_id).map((effect) => ({
+    ...effect,
+    after_hash: hashFile(path.join(root, effect.path)),
+  }));
+  s.writeLedger.markAppliedUncommitted(s.writeLedger.get(submit.intent.intent_id), effectsAfter);
   s.close();
 
   const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });

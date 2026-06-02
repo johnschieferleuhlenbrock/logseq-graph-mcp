@@ -97,6 +97,7 @@ test("logseq-graph-mcp exposes doctor and update maintenance commands", () => {
   assert.equal(doctorReport.version, packageJson.version);
   assert.equal(doctorReport.install.mode, "source");
   assert.equal(doctorReport.checks.some((check) => check.name === "package metadata" && check.ok), true);
+  assert.equal(doctorReport.checks.some((check) => check.name === "node" && check.ok && check.detail.includes(packageJson.engines.node)), true);
 
   const update = run(["update", "--check", "--json"], { LOGSEQ_UPDATE_LATEST_VERSION: "99.0.0" });
   assert.equal(update.status, 0, update.stderr);

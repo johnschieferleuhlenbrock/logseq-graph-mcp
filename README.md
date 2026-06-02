@@ -13,7 +13,7 @@ or browser session.
 
 ## Requirements
 
-- Node.js 20.17.0 or newer, plus npm for source installs or `npx` usage.
+- Node.js 20.17.0+ on Node 20, or Node.js 22.9.0+ on newer majors, plus npm for source installs or `npx` usage.
 - A local Logseq graph directory containing `pages/`.
 - Git installed when `LOGSEQ_GIT_GUARD=strict` is used for write-capable
   sessions.
@@ -190,7 +190,7 @@ Proceed only when the reported Git state and generated-index state are expected.
 | `LOGSEQ_GIT_MAX_DELETED_FILES` | `0` | Maximum deleted files allowed per guarded write; strict blocks, warn logs and checkpoints |
 | `LOGSEQ_GIT_COMMIT_AUTHOR` | local MCP guard author | Author for checkpoint commits |
 | `LOGSEQ_GIT_GUARD_IGNORE_DIRS` | unset | Comma-separated top-level guard ignores |
-| `LOGSEQ_CACHE_DIR` | `~/.cache/logseq-mcp` | Persistent frontmatter and adjacency cache directory |
+| `LOGSEQ_CACHE_DIR` | `~/.cache/logseq-mcp` | Persistent frontmatter, adjacency cache, and durable write-intent ledger directory |
 | `LOGSEQ_WATCH` | `1` | Set `0` to disable filesystem watcher invalidation |
 | `LOGSEQ_LOCK_TIMEOUT_MS` | `5000` | Lock acquisition timeout for writes |
 | `LOGSEQ_MAX_RESPONSE_BYTES` | `500000` | Maximum JSON response size |

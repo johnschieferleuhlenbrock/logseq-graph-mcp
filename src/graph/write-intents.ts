@@ -186,7 +186,15 @@ export class WriteIntentLedger {
       this.insertEvent(opId, null, "pending", "submit", input.caller, { preview: input.preview, request_hash: requestHash });
       for (const effect of input.effects) this.insertEffect(opId, effect);
     });
-    tx();
+    try {
+      tx();
+    } catch (err) {
+      if (String((err as Error).message).includes("UNIQUE constraint failed")) {
+        const raced = this.lookupSubmission(input);
+        if (raced) return raced;
+      }
+      throw err;
+    }
     return { record: this.get(opId)!, duplicate: false, conflict: false, preview: input.preview };
   }
 
@@ -536,7 +544,7 @@ export class WriteIntentLedger {
 export function publicRecord(record: WriteIntentRecord): Record<string, unknown> {
   return {
     intent_id: record.op_id,
-    idempotency_key: record.idempotency_key,
+    idempotency_key: clientIdempotencyKey(record.idempotency_key),
     request_hash: record.request_hash,
     tool: record.tool,
     arguments: JSON.parse(record.canonical_args_json),
@@ -556,4 +564,9 @@ export function publicRecord(record: WriteIntentRecord): Record<string, unknown>
     expires_at: record.expires_at,
     expected_base_head: record.expected_base_head,
   };
+}
+
+function clientIdempotencyKey(scopedKey: string): string {
+  const parts = scopedKey.split(":");
+  return parts.length >= 4 ? parts.slice(3).join(":") : scopedKey;
 }

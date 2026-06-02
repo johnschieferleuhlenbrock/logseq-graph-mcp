@@ -1036,13 +1036,13 @@ export class LogseqServer {
       return;
     }
 
-    if (dirtyPaths.length && this.recoveryEffectsMatch(latest, args, effects, already)) {
+    if (dirtyPaths.length && this.recoveryEffectsMatch(latest, args, effects)) {
       const commitHash = this.commitRecoveredIntent(latest, dirtyPaths);
       this.writeLedger.markCompleted(latest, this.ok({ reconciled: true, git_commit: commitHash, committed_paths: dirtyPaths }), commitHash, true);
       return;
     }
 
-    if (already.ok) {
+    if (!dirtyPaths.length && already.ok) {
       this.writeLedger.markCompleted(latest, this.ok({ reconciled: true, already_applied: true, result: already }), null, true);
       return;
     }
@@ -1050,9 +1050,9 @@ export class LogseqServer {
     this.writeLedger.markManual(latest, "unable to reconcile expired write intent", { dirty_paths: dirtyPaths, effects });
   }
 
-  private recoveryEffectsMatch(record: WriteIntentRecord, args: Record<string, unknown>, effects: WriteIntentEffect[], already: ToolResult): boolean {
+  private recoveryEffectsMatch(record: WriteIntentRecord, args: Record<string, unknown>, effects: WriteIntentEffect[]): boolean {
     if (record.tool === "regenerate_index") return effects.every((effect) => effect.path === "generated/graph_index.json" && fileSha256(path.join(this.root, effect.path)) !== effect.expected_base_hash);
-    if (already.ok) return true;
+    if (this.recoveryAfterHashesMatch(effects)) return true;
     if (record.tool === "delete_page") {
       const source = effects.find((effect) => effect.effect_type === "delete_page");
       const archive = effects.find((effect) => effect.effect_type === "delete_page_archive");
@@ -1074,6 +1074,13 @@ export class LogseqServer {
         && sourceText.includes(`[[${String(args.new_name ?? "")}]]`);
     }
     return false;
+  }
+
+  private recoveryAfterHashesMatch(effects: WriteIntentEffect[]): boolean {
+    const nonAuditEffects = effects.filter((effect) => effect.effect_type !== "audit_journal");
+    if (!nonAuditEffects.length) return false;
+    return effects.every((effect) => effect.after_hash !== undefined
+      && fileSha256(path.join(this.root, effect.path)) === effect.after_hash);
   }
 
   private findIntentCommit(record: WriteIntentRecord): string | null {
