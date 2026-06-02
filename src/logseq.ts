@@ -885,6 +885,8 @@ export class LogseqServer {
       const valid = new Set(["replace_block", "append_to_section", "prepend_to_section", "delete_block"]);
       if (!anchor) return this.err("anchor is required");
       if (!valid.has(mode)) return this.err(`mode must be one of ${JSON.stringify(Array.from(valid).sort())}, got ${JSON.stringify(mode)}`);
+      const [, body] = this.splitFrontmatter(readText(p));
+      if (!this.bodyBlockForAnchor(body, anchor)) return this.err("anchor not found or ambiguous");
       let newContent = args.new_content == null ? undefined : String(args.new_content);
       if (mode === "delete_block") {
         if (newContent != null && newContent !== "") return this.err("new_content must be omitted or empty for mode='delete_block'");

@@ -790,7 +790,7 @@ test("safe create_stub intent does not complete from a partial external stub", (
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("safe write intents move stale base and missing anchor conflicts to manual review", () => {
+test("safe write intents move stale base conflicts to manual review and reject invalid anchors", () => {
   const root = makeGraph();
   const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
   const before = run("git", ["rev-parse", "HEAD"], root);
@@ -814,11 +814,8 @@ test("safe write intents move stale base and missing anchor conflicts to manual 
     arguments: { name: "Alice", anchor: "not in file", new_content: "- replacement" },
     caller: "test",
   });
-  assert.equal(missingAnchor.ok, true);
-  flush = s.callTool("flush_write_intents", { intent_ids: [missingAnchor.intent.intent_id] });
-  assert.equal(flush.results[0].ok, false);
-  assert.equal(flush.results[0].state, "manual_review");
-  assert.match(JSON.stringify(flush.results[0]), /anchor/);
+  assert.equal(missingAnchor.ok, false);
+  assert.match(missingAnchor.error, /anchor/);
 
   const missingDeleteAnchor = s.callTool("submit_write_intent", {
     idempotency_key: "test:missing-delete-anchor",
@@ -826,11 +823,20 @@ test("safe write intents move stale base and missing anchor conflicts to manual 
     arguments: { name: "Alice", anchor: "not in file", mode: "delete_block" },
     caller: "test",
   });
-  assert.equal(missingDeleteAnchor.ok, true);
-  flush = s.callTool("flush_write_intents", { intent_ids: [missingDeleteAnchor.intent.intent_id] });
-  assert.equal(flush.results[0].ok, false);
-  assert.equal(flush.results[0].state, "manual_review");
-  assert.match(JSON.stringify(flush.results[0]), /anchor/);
+  assert.equal(missingDeleteAnchor.ok, false);
+  assert.match(missingDeleteAnchor.error, /anchor/);
+
+  writePage(root, "Ambiguous Body", "type:: note\n\n- target\n- target\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add ambiguous body"], root);
+  const ambiguousAnchor = s.callTool("submit_write_intent", {
+    idempotency_key: "test:ambiguous-anchor",
+    tool: "update_body_section",
+    arguments: { name: "Ambiguous Body", anchor: "target", new_content: "- replacement" },
+    caller: "test",
+  });
+  assert.equal(ambiguousAnchor.ok, false);
+  assert.match(ambiguousAnchor.error, /anchor/);
 
   const staleDelete = s.callTool("submit_write_intent", {
     idempotency_key: "test:stale-delete-property",
@@ -873,7 +879,7 @@ test("safe update_body_section delete intent deletes instead of matching empty m
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("safe update_body_section replace does not complete when anchor is missing but content exists elsewhere", () => {
+test("safe update_body_section replace rejects missing anchor even when content exists elsewhere", () => {
   const root = makeGraph();
   writePage(root, "Body Replace", "type:: note\n\n- existing replacement text\n- keep original\n");
   run("git", ["add", "-A"], root);
@@ -885,11 +891,8 @@ test("safe update_body_section replace does not complete when anchor is missing 
     arguments: { name: "Body Replace", anchor: "missing anchor", mode: "replace_block", new_content: "- existing replacement text" },
     caller: "test",
   });
-  assert.equal(submit.ok, true);
-  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
-  assert.equal(flush.results[0].ok, false);
-  assert.equal(flush.results[0].state, "manual_review");
-  assert.match(JSON.stringify(flush.results[0]), /anchor/);
+  assert.equal(submit.ok, false);
+  assert.match(submit.error, /anchor/);
   const page = s.read_page("Body Replace");
   assert.match(page.body, /keep original/);
   fs.rmSync(root, { recursive: true, force: true });
