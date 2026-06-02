@@ -939,6 +939,35 @@ test("startup reconciliation returns applying-before-write intents to pending", 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("startup reconciliation ignores audit-only drift before target writes", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-before-write-audit-drift",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  assert.equal(started.state, "applying");
+  const auditEffect = s.writeLedger.effects(submit.intent.intent_id).find((effect) => effect.effect_type === "audit_journal");
+  assert.ok(auditEffect);
+  fs.mkdirSync(path.dirname(path.join(root, auditEffect.path)), { recursive: true });
+  fs.writeFileSync(path.join(root, auditEffect.path), "- unrelated committed audit entry\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "unrelated audit write"], root);
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "pending");
+  assert.equal(recovered.read_page("Alice").properties.status, "active");
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("write intent polling recovers leases that expire after startup", () => {
   const root = makeGraph();
   const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });

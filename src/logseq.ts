@@ -1001,7 +1001,8 @@ export class LogseqServer {
     const args = JSON.parse(latest.canonical_args_json) as Record<string, unknown>;
     const already = this.intentAlreadyApplied(latest.tool, args);
     const effects = this.writeLedger.effects(latest.op_id);
-    const allAtBase = effects.every((effect) => fileSha256(path.join(this.root, effect.path)) === effect.expected_base_hash);
+    const nonAuditEffects = effects.filter((effect) => effect.effect_type !== "audit_journal");
+    const allAtBase = nonAuditEffects.every((effect) => fileSha256(path.join(this.root, effect.path)) === effect.expected_base_hash);
     if (allAtBase && latest.state === "reconciling") {
       this.writeLedger.markPending(latest, "reconciled_no_file_effects", {});
       return;
