@@ -13,7 +13,7 @@ or browser session.
 
 ## Requirements
 
-- Node.js 20.17.0+ on Node 20, or Node.js 22.9.0+ on newer majors, plus npm for source installs or `npx` usage.
+- Node.js 20.17.0+ on Node 20, Node.js 22.9.0+ on Node 22, or Node.js 23-26, plus npm for source installs or `npx` usage.
 - A local Logseq graph directory containing `pages/`.
 - Git installed when `LOGSEQ_GIT_GUARD=strict` is used for write-capable
   sessions.

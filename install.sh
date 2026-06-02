@@ -50,12 +50,12 @@ if [[ -z "$ROOT" ]]; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js ^20.17.0 or >=22.9.0 is required." >&2
+  echo "Node.js ^20.17.0, ^22.9.0, or 23.x-26.x is required." >&2
   exit 1
 fi
 
-if ! node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); const ok = (major === 20 && (minor > 17 || (minor === 17 && patch >= 0))) || (major > 22 || (major === 22 && (minor > 9 || (minor === 9 && patch >= 0)))); process.exit(ok ? 0 : 1)' >/dev/null 2>&1; then
-  echo "Node.js ^20.17.0 or >=22.9.0 is required; found $(node -v)." >&2
+if ! node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); const ok = (major === 20 && (minor > 17 || (minor === 17 && patch >= 0))) || (major === 22 && (minor > 9 || (minor === 9 && patch >= 0))) || (major >= 23 && major <= 26); process.exit(ok ? 0 : 1)' >/dev/null 2>&1; then
+  echo "Node.js ^20.17.0, ^22.9.0, or 23.x-26.x is required; found $(node -v)." >&2
   exit 1
 fi
 
