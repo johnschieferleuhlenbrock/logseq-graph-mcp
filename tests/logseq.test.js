@@ -607,6 +607,16 @@ test("safe write intents reject schema and dangling links before ledger mutation
   assert.equal(res.ok, false);
   assert.match(res.error, /not in schema/);
 
+  fs.mkdirSync(path.join(root, "pages", "Directory Stub.md"));
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:create-stub-existing-path",
+    tool: "create_stub",
+    arguments: { name: "Directory Stub" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /File exists/);
+
   res = s.callTool("submit_write_intent", {
     idempotency_key: "test:create-stub-dangling",
     tool: "create_stub",

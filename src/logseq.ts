@@ -837,6 +837,9 @@ export class LogseqServer {
       const safe = this.safeName(name);
       if (safe) return this.err(safe);
       if (this.findPagePath(name)) return this.err(`Page already exists: ${name}`);
+      const p = path.join(this.pages, `${name}.md`);
+      if (!this.under(p, this.pages)) return this.err("path escapes PAGES dir");
+      if (pathExists(p)) return this.err(`File exists: ${rel(this.root, p)}`);
       const pageType = String(args.page_type ?? "person");
       let props: Frontmatter = [["type", pageType], ["confidence", String(args.confidence ?? "low")]];
       if (args.source != null) props.push(["source", String(args.source)]);
@@ -853,7 +856,6 @@ export class LogseqServer {
         const [linkOk, linkMsg, dangling] = this.checkLinksResolve(bundle, Boolean(args.allow_dangling));
         if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
       }
-      const p = path.join(this.pages, `${name}.md`);
       target(p, "create_stub", `type:: ${String(args.page_type ?? "person")}`);
       targetAudit();
       return this.ok({ preview: { tool, name, target_paths: [rel(this.root, p)] }, effects });
