@@ -1046,8 +1046,17 @@ export class LogseqServer {
       const destination = effects.find((effect) => effect.effect_type === "rename_page_destination");
       return Boolean(source && destination && fileSha256(path.join(this.root, source.path)) === null && fileSha256(path.join(this.root, destination.path)) === source.expected_base_hash);
     }
-    const markerEffects = effects.filter((effect) => effect.applied_marker);
-    return markerEffects.length > 0 && markerEffects.every((effect) => this.effectMarkerExists(effect));
+    if (record.tool === "rename_page") {
+      const source = effects.find((effect) => effect.effect_type === "rename_page_source");
+      const destination = effects.find((effect) => effect.effect_type === "rename_page_destination");
+      if (!source || !destination) return false;
+      const sourcePath = path.join(this.root, source.path);
+      const sourceText = pathExists(sourcePath) ? readText(sourcePath) : "";
+      return fileSha256(path.join(this.root, destination.path)) === source.expected_base_hash
+        && /(^|\n)type:: redirect(\n|$)/.test(sourceText)
+        && sourceText.includes(`[[${String(args.new_name ?? "")}]]`);
+    }
+    return false;
   }
 
   private findIntentCommit(record: WriteIntentRecord): string | null {
@@ -1165,16 +1174,6 @@ export class LogseqServer {
     return this.ok();
   }
 
-  private effectMarkerExists(effect: WriteIntentEffect): boolean {
-    if (!effect.applied_marker) return false;
-    const fullPath = path.join(this.root, effect.path);
-    try {
-      return readText(fullPath).includes(effect.applied_marker);
-    } catch {
-      return false;
-    }
-  }
-
   private intentAlreadyApplied(tool: string, args: Record<string, unknown>): ToolResult {
     if (tool === "update_property") {
       const p = this.findPagePath(String(args.name ?? ""));
@@ -1188,6 +1187,17 @@ export class LogseqServer {
       if (!p || !key) return this.err("not applied");
       const props = this.propsDict(this.splitFrontmatter(readText(p))[0]);
       return props[key] == null ? this.ok({ name: stem(p), key, property_absent: true }) : this.err("not applied");
+    }
+    if (tool === "batch_update_property") {
+      const updates = Array.isArray(args.updates) ? args.updates as Array<Record<string, unknown>> : [];
+      if (!updates.length) return this.err("not applied");
+      for (const update of updates) {
+        const p = this.findPagePath(String(update.name ?? ""));
+        if (!p) return this.err("not applied");
+        const props = this.propsDict(this.splitFrontmatter(readText(p))[0]);
+        if (props[String(update.key ?? "")] !== String(update.value ?? "")) return this.err("not applied");
+      }
+      return this.ok({ update_count: updates.length });
     }
     if (tool === "update_body_section") {
       const p = this.findPagePath(String(args.name ?? ""));

@@ -1098,6 +1098,29 @@ test("startup reconciliation commits recovered delete_property effects", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("startup reconciliation rejects unrelated dirty delete_property marker matches", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-delete-property-marker-mismatch",
+    tool: "delete_property",
+    arguments: { name: "Alice", key: "status" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: archived\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "manual_review");
+  assert.equal(recovered.read_page("Alice").properties.status, "archived");
+  assert.match(status(root), /pages\/Alice\.md/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("startup reconciliation commits recovered source-delete effects", () => {
   const root = makeGraph();
   const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
