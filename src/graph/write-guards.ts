@@ -1,5 +1,15 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+export type LockMetadata = {
+  op_id?: string;
+  pid: number;
+  hostname: string;
+  created_at: string;
+  expires_at: string;
+  target: string;
+};
 
 export function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -49,13 +59,27 @@ export class LockHandle {
   }
 }
 
-export function acquireLock(targetPath: string, timeoutMs: number): LockHandle {
+export function lockMetadata(targetPath: string, timeoutMs: number, opId?: string): LockMetadata {
+  const now = Date.now();
+  return {
+    op_id: opId,
+    pid: process.pid,
+    hostname: os.hostname(),
+    created_at: new Date(now).toISOString(),
+    expires_at: new Date(now + timeoutMs).toISOString(),
+    target: targetPath,
+  };
+}
+
+export function acquireLock(targetPath: string, timeoutMs: number, opId?: string): LockHandle {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   const lockPath = `${targetPath}.lock`;
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      return new LockHandle(lockPath, fs.openSync(lockPath, "wx", 0o644));
+      const fd = fs.openSync(lockPath, "wx", 0o644);
+      fs.writeFileSync(fd, `${JSON.stringify(lockMetadata(targetPath, timeoutMs, opId), null, 2)}\n`, "utf8");
+      return new LockHandle(lockPath, fd);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "EEXIST" || Date.now() > deadline) {
@@ -66,8 +90,8 @@ export function acquireLock(targetPath: string, timeoutMs: number): LockHandle {
   }
 }
 
-export function withFileLock<T>(targetPath: string, timeoutMs: number, fn: () => T): T {
-  const lock = acquireLock(targetPath, timeoutMs);
+export function withFileLock<T>(targetPath: string, timeoutMs: number, fn: () => T, opId?: string): T {
+  const lock = acquireLock(targetPath, timeoutMs, opId);
   try {
     return fn();
   } finally {

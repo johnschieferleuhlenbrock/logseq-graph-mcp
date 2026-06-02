@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PersistentGraphCache, fingerprintKey, pageFingerprint } from "./graph/cache.js";
@@ -9,12 +10,25 @@ import { FENCE_RE, INLINE_CODE_RE, WIKILINK_RE, extractWikilinkTargets } from ".
 import { SAFE_DATE_RE, fromJournalDate, normalizeNamespaceName, parseIsoDate as parseDate, safePageName, slugifyPageName, toJournalDate } from "./graph/names.js";
 import { PROP_RE, joinFrontmatter, propsDelete, propsDict, propsSet, splitFrontmatter } from "./graph/properties.js";
 import { GraphWatcher } from "./graph/watch.js";
-import { atomicWriteFileSync, withFileLock } from "./graph/write-guards.js";
-import { TOOL_DEFINITIONS } from "./tool-schemas.js";
+import { LockHandle, atomicWriteFileSync, lockMetadata, sleepMs, withFileLock } from "./graph/write-guards.js";
+import { RAW_MUTATING_TOOL_NAMES, READ_TOOL_NAMES, SAFE_WRITE_TOOL_NAMES, toolDefinitionsForMode } from "./tool-schemas.js";
 import { compileSearchRegex, regexEngineName } from "./tools/search.js";
+import { packageVersion } from "./package-info.js";
+import {
+  WriteIntentLedger,
+  canonicalizeJson,
+  fileSha256,
+  nowIso,
+  publicRecord,
+  sha256,
+  type WriteIntentEffect,
+  type WriteIntentRecord,
+} from "./graph/write-intents.js";
 import type { Frontmatter, GraphNode, StatusEntry, ToolDefinition, ToolResult } from "./types.js";
 
 const META_TYPES = new Set(["schema", "query", "runbook", "glossary"]);
+const SERVER_WRITE_DEADLINE_MS = 45000;
+const RAW_INTENT_TOOLS = new Set(Array.from(RAW_MUTATING_TOOL_NAMES));
 
 function boolEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes((value ?? "").toLowerCase());
@@ -63,6 +77,7 @@ export class LogseqServer {
   readonly disallowForce: boolean;
   readonly linkMode: string;
   readonly readonlyMode: boolean;
+  readonly writeMode: string;
   readonly maxRegexLen: number;
   readonly regexTimeoutMs: number;
   readonly maxSearchLine: number;
@@ -81,7 +96,9 @@ export class LogseqServer {
   private adjacency: Map<string, GraphNode> | null = null;
   private adjacencyFingerprint = "";
   private readonly persistentCache: PersistentGraphCache;
+  private readonly writeLedger: WriteIntentLedger;
   private readonly watcher: GraphWatcher | null;
+  private activeWriteIntent: { op_id: string; idempotency_key: string; request_hash: string; expected_paths: Set<string>; effects: WriteIntentEffect[] } | null = null;
 
   constructor(options: LogseqServerOptions = {}) {
     const env = options.env ?? process.env;
@@ -95,6 +112,12 @@ export class LogseqServer {
     this.disallowForce = boolEnv(env.LOGSEQ_DISALLOW_FORCE);
     this.linkMode = (env.LOGSEQ_VALIDATE_LINKS ?? "block").toLowerCase();
     this.readonlyMode = boolEnv(env.LOGSEQ_READONLY);
+    const requestedWriteMode = (env.LOGSEQ_WRITE_MODE ?? "intent").toLowerCase();
+    this.writeMode = this.readonlyMode
+      ? "readonly"
+      : ["readonly", "intent", "admin_raw"].includes(requestedWriteMode)
+        ? requestedWriteMode
+        : "readonly";
     this.maxRegexLen = Number.parseInt(env.LOGSEQ_MAX_REGEX_LEN ?? "500", 10);
     this.regexTimeoutMs = Math.round(Number.parseFloat(env.LOGSEQ_REGEX_TIMEOUT_S ?? "2") * 1000);
     this.maxSearchLine = Number.parseInt(env.LOGSEQ_MAX_SEARCH_LINE ?? "10000", 10);
@@ -110,17 +133,19 @@ export class LogseqServer {
       .map((d) => trimSlashes(d.trim()))
       .filter(Boolean);
     this.persistentCache = new PersistentGraphCache(this.root, env.LOGSEQ_CACHE_DIR);
+    this.writeLedger = new WriteIntentLedger(this.persistentCache.cacheFile);
     this.watcher = (env.LOGSEQ_WATCH ?? "1") === "0"
       ? null
       : new GraphWatcher([this.pages, this.journals], () => this.invalidate());
+    if (!this.readonlyMode && this.writeMode !== "readonly") this.reconcileWriteIntents();
   }
 
   toolDefinitions(): ToolDefinition[] {
-    return TOOL_DEFINITIONS;
+    return toolDefinitionsForMode(this.writeMode, this.readonlyMode);
   }
 
   tools(): Record<string, (args: Record<string, unknown>) => ToolResult> {
-    return {
+    const readTools: Record<string, (args: Record<string, unknown>) => ToolResult> = {
       list_pages: (a) => this.list_pages(a),
       read_page: (a) => this.read_page(String(a.name ?? ""), Boolean(a.include_raw)),
       read_pages: (a) => this.read_pages(a),
@@ -136,6 +161,19 @@ export class LogseqServer {
       graph_stats: (a) => this.graph_stats(a),
       find_components: (a) => this.find_components(a),
       find_dangling_links: (a) => this.find_dangling_links(a),
+    };
+    if (this.readonlyMode || this.writeMode === "readonly") return readTools;
+    const safeTools: Record<string, (args: Record<string, unknown>) => ToolResult> = {
+      submit_write_intent: (a) => this.submit_write_intent(a),
+      flush_write_intents: (a) => this.flush_write_intents(a),
+      get_write_intent: (a) => this.get_write_intent(a),
+      list_write_intents: (a) => this.list_write_intents(a),
+      cancel_write_intent: (a) => this.cancel_write_intent(a),
+    };
+    if (this.writeMode !== "admin_raw") return { ...readTools, ...safeTools };
+    return {
+      ...readTools,
+      ...safeTools,
       update_property: (a) => this.update_property(a),
       batch_update_property: (a) => this.batch_update_property(a),
       delete_property: (a) => this.delete_property(String(a.name ?? ""), String(a.key ?? "")),
@@ -166,6 +204,7 @@ export class LogseqServer {
       `[logseq-mcp] pages = ${this.pages} (${pages} pages)`,
       `[logseq-mcp] journals = ${this.journals}`,
       `[logseq-mcp] readonly = ${this.readonlyMode ? "True" : "False"}`,
+      `[logseq-mcp] write mode = ${this.writeMode}`,
       `[logseq-mcp] schema mode = ${this.schemaMode}`,
       `[logseq-mcp] git guard mode = ${this.gitGuardMode}`,
       `[logseq-mcp] schema keys loaded = ${this.knownSchemaKeys().size}`,
@@ -236,7 +275,7 @@ export class LogseqServer {
   }
 
   private withLock<T>(targetPath: string, fn: () => T, timeoutMs = 5000): T {
-    return withFileLock(targetPath, timeoutMs === 5000 ? this.lockTimeoutMs : timeoutMs, fn);
+    return withFileLock(targetPath, timeoutMs === 5000 ? this.lockTimeoutMs : timeoutMs, fn, this.activeWriteIntent?.op_id);
   }
 
   private atomicWrite(p: string, content: string): void {
@@ -254,6 +293,7 @@ export class LogseqServer {
   close(): void {
     this.watcher?.close();
     this.persistentCache.flush();
+    this.writeLedger.close();
   }
 
   private allPagePaths(): string[] {
@@ -375,10 +415,11 @@ export class LogseqServer {
 
   private audit(line: string): void {
     const safeLine = line.replace(/[\r\n\t\x00-\x1f]/g, " ").slice(0, 500);
-    const jpath = path.join(this.journals, `${toJournalDate(nowIsoDate())}.md`);
+    const plannedAuditRel = this.activeWriteIntent?.effects.find((effect) => effect.effect_type === "audit_journal")?.path ?? null;
+    const jpath = plannedAuditRel ? path.join(this.root, plannedAuditRel) : path.join(this.journals, `${toJournalDate(nowIsoDate())}.md`);
     const stamp = `\t- ${localTimeHHMM()} · ${safeLine}\n`;
     try {
-      fs.mkdirSync(this.journals, { recursive: true });
+      fs.mkdirSync(path.dirname(jpath), { recursive: true });
       this.withLock(jpath, () => {
         if (pathExists(jpath)) {
           let text = readText(jpath);
@@ -447,6 +488,84 @@ export class LogseqServer {
       || [".pyc", ".pyo", ".pyd"].some((s) => p.endsWith(s));
   }
 
+  private lockHealth(limit = 20): Record<string, unknown> {
+    const gitLock = path.join(this.root, ".mcp-git-guard.lock");
+    const pageLocks: Array<Record<string, unknown>> = [];
+    for (const base of [this.pages, this.journals]) {
+      if (!pathExists(base)) continue;
+      for (const p of this.findLockFiles(base, limit - pageLocks.length)) {
+        pageLocks.push(this.describeLock(p));
+        if (pageLocks.length >= limit) break;
+      }
+      if (pageLocks.length >= limit) break;
+    }
+    return {
+      git_guard: pathExists(gitLock) ? this.describeLock(gitLock) : { exists: false, path: rel(this.root, gitLock) },
+      file_locks: pageLocks,
+      file_lock_count_sampled: pageLocks.length,
+    };
+  }
+
+  private findLockFiles(dir: string, limit: number): string[] {
+    if (limit <= 0) return [];
+    const found: string[] = [];
+    const walk = (current: string) => {
+      if (found.length >= limit) return;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isFile() && entry.name.endsWith(".lock")) found.push(full);
+        if (found.length >= limit) return;
+      }
+    };
+    walk(dir);
+    return found;
+  }
+
+  private describeLock(lockPath: string): Record<string, unknown> {
+    let stat: fs.Stats | null = null;
+    try {
+      stat = fs.statSync(lockPath);
+    } catch {
+      return { exists: false, path: rel(this.root, lockPath) };
+    }
+    let metadata: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(readText(lockPath));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) metadata = parsed as Record<string, unknown>;
+    } catch {
+      metadata = {};
+    }
+    const pid = Number(metadata.pid ?? 0);
+    const processAlive = pid > 0 ? this.processAlive(pid) : null;
+    const expiresAt = typeof metadata.expires_at === "string" ? metadata.expires_at : null;
+    const stale = expiresAt ? Date.parse(expiresAt) < Date.now() && processAlive === false : false;
+    return {
+      exists: true,
+      path: rel(this.root, lockPath),
+      mtime: stat ? new Date(stat.mtimeMs).toISOString() : null,
+      age_seconds: stat ? Math.max(0, Math.round((Date.now() - stat.mtimeMs) / 1000)) : null,
+      metadata,
+      process_alive: processAlive,
+      stale,
+    };
+  }
+
+  private processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   gitStatusEntries(): StatusEntry[] {
     const r = this.git(["status", "--porcelain=v1", "--untracked-files=all", "-z"], 20000);
     if (r.status !== 0) {
@@ -480,7 +599,14 @@ export class LogseqServer {
   }
 
   private beginTxn(tool: string, maxChangedFiles = this.gitMaxChangedFiles, maxDeletedFiles = this.gitMaxDeletedFiles): GitTxn {
-    const txn = new GitTxn(this, tool, maxChangedFiles, maxDeletedFiles, uniqueId);
+    const metadata: Record<string, string> = this.activeWriteIntent
+      ? {
+        op_id: this.activeWriteIntent.op_id,
+        idempotency_key: this.activeWriteIntent.idempotency_key,
+        request_hash: this.activeWriteIntent.request_hash,
+      }
+      : {};
+    const txn = new GitTxn(this, tool, maxChangedFiles, maxDeletedFiles, uniqueId, metadata, this.activeWriteIntent?.expected_paths ?? null);
     txn.begin();
     return txn;
   }
@@ -488,6 +614,702 @@ export class LogseqServer {
   private attachGit(response: ToolResult, txn: GitTxn): ToolResult {
     if (txn.commit) response.git_guard = txn.payload();
     return response;
+  }
+
+  submit_write_intent(args: Record<string, unknown>): ToolResult {
+    const idempotencyKey = String(args.idempotency_key ?? "").trim();
+    const tool = String(args.tool ?? "").trim();
+    const caller = String(args.caller ?? "unknown").trim() || "unknown";
+    const expectedBaseHead = args.expected_base_head == null ? null : String(args.expected_base_head);
+    const expiresAt = args.expires_at == null ? null : String(args.expires_at);
+    const rawArguments = args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments)
+      ? args.arguments as Record<string, unknown>
+      : null;
+    if (!idempotencyKey) return this.err("idempotency_key is required");
+    if (!RAW_INTENT_TOOLS.has(tool)) return this.err(`tool must be one of ${JSON.stringify(Array.from(RAW_INTENT_TOOLS).sort())}`);
+    if (!rawArguments) return this.err("arguments must be an object");
+    if (expiresAt && Number.isNaN(Date.parse(expiresAt))) return this.err("expires_at must be an ISO timestamp");
+    const normalized = this.normalizeWriteIntentArgs(tool, rawArguments);
+    if (!normalized.ok) return normalized;
+    const canonicalArgs = normalized.arguments as Record<string, unknown>;
+    const validation = this.validateWriteIntent(tool, canonicalArgs);
+    if (!validation.ok) return validation;
+    const preview = validation.preview as Record<string, unknown>;
+    const effects = validation.effects as WriteIntentEffect[];
+    const submitted = this.writeLedger.submit({
+      idempotencyKey,
+      tool,
+      canonicalArgs,
+      caller,
+      expectedBaseHead,
+      expiresAt,
+      gitBeforeHead: this.gitInsideWorktree() ? this.gitHead() : "",
+      effects,
+      preview,
+    });
+    if (submitted.conflict) {
+      return this.err("idempotency_conflict: same idempotency_key was used with different arguments", {
+        error_class: "idempotency_conflict",
+        intent: publicRecord(submitted.record),
+      });
+    }
+    return this.ok({ intent: publicRecord(submitted.record), duplicate: submitted.duplicate, preview: submitted.preview });
+  }
+
+  get_write_intent(args: Record<string, unknown>): ToolResult {
+    this.reconcileWriteIntents();
+    const intentId = String(args.intent_id ?? "");
+    if (!intentId) return this.err("intent_id is required");
+    const record = this.writeLedger.get(intentId);
+    if (!record) return this.err(`write intent not found: ${intentId}`);
+    return this.ok({ intent: publicRecord(record), effects: this.writeLedger.effects(intentId) });
+  }
+
+  list_write_intents(args: Record<string, unknown>): ToolResult {
+    this.reconcileWriteIntents();
+    const states = Array.isArray(args.states) ? args.states.map(String).filter(Boolean) : [];
+    const limit = Number(args.limit ?? 50);
+    const offset = Number(args.offset ?? 0);
+    const records = this.writeLedger.list(states, limit, offset);
+    return this.ok({ intents: records.map(publicRecord), count: records.length, ledger: { file: this.writeLedger.ledgerFile, counts: this.writeLedger.counts() } });
+  }
+
+  cancel_write_intent(args: Record<string, unknown>): ToolResult {
+    this.reconcileWriteIntents();
+    const intentId = String(args.intent_id ?? "");
+    if (!intentId) return this.err("intent_id is required");
+    return this.writeLedger.cancel(intentId, String(args.caller ?? "unknown"));
+  }
+
+  flush_write_intents(args: Record<string, unknown>): ToolResult {
+    this.reconcileWriteIntents();
+    const intentIds = Array.isArray(args.intent_ids) ? args.intent_ids.map(String).filter(Boolean) : [];
+    const maxItems = Math.max(1, Math.min(Number(args.max_items ?? (intentIds.length || 1)), 100));
+    if (!intentIds.length) return this.err("intent_ids is required and must not be empty");
+    const selected = intentIds.slice(0, maxItems);
+    const results: Array<Record<string, unknown>> = [];
+    let success = 0;
+    for (const intentId of selected) {
+      const record = this.writeLedger.get(intentId);
+      if (!record) {
+        results.push({ intent_id: intentId, ok: false, state: "missing", error: "write intent not found" });
+        continue;
+      }
+      const result = this.flushOneWriteIntent(record);
+      results.push(result);
+      if (result.ok) success += 1;
+    }
+    return this.ok({ results, success_count: success, failure_count: results.length - success, total: results.length });
+  }
+
+  private normalizeWriteIntentArgs(tool: string, args: Record<string, unknown>): ToolResult {
+    const out: Record<string, unknown> = { ...args };
+    if (tool === "append_contact_log" && out.date == null) out.date = nowIsoDate();
+    if (tool === "append_journal_bullet" && out.date == null) out.date = nowIsoDate();
+    if (tool === "update_body_section" && out.mode == null) out.mode = "replace_block";
+    if (tool === "create_stub") {
+      if (out.page_type == null) out.page_type = "person";
+      if (out.confidence == null) out.confidence = "low";
+    }
+    if (tool === "rename_page" && out.leave_redirect == null) out.leave_redirect = true;
+    return this.ok({ arguments: JSON.parse(canonicalizeJson(out)) });
+  }
+
+  private validateWriteIntent(tool: string, args: Record<string, unknown>): ToolResult {
+    const effects: WriteIntentEffect[] = [];
+    const targetPaths: string[] = [];
+    const target = (filePath: string, effectType: string, marker?: string | null) => {
+      targetPaths.push(filePath);
+      effects.push({
+        path: rel(this.root, filePath),
+        effect_type: effectType,
+        before_hash: fileSha256(filePath),
+        expected_base_hash: fileSha256(filePath),
+        applied_marker: marker ?? null,
+      });
+    };
+    const targetAudit = () => {
+      const p = path.join(this.journals, `${toJournalDate(nowIsoDate())}.md`);
+      target(p, "audit_journal");
+    };
+    if (tool === "regenerate_index") {
+      target(path.join(this.root, "generated", "graph_index.json"), "regenerate_index");
+      return this.ok({ preview: { tool, target_paths: targetPaths.map((p) => rel(this.root, p)) }, effects });
+    }
+    if (tool === "update_property") {
+      const name = String(args.name ?? "");
+      const key = String(args.key ?? "");
+      const value = String(args.value ?? "");
+      const [pageErr, p] = this.readWritePage(name);
+      if (pageErr) return pageErr;
+      if (!key) return this.err("key is required");
+      const [allowed, schemaMsg] = this.checkSchema(key, Boolean(args.force));
+      if (!allowed) return this.err(schemaMsg!);
+      const [linkOk, linkMsg, dangling] = this.checkLinksResolve(value, Boolean(args.allow_dangling));
+      if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+      target(p, "update_property", `${key}:: ${value}`);
+      targetAudit();
+      return this.ok({ preview: { tool, name: stem(p), key, to: value, target_paths: [rel(this.root, p)] }, effects });
+    }
+    if (tool === "batch_update_property") {
+      const updates = Array.isArray(args.updates) ? args.updates as Array<Record<string, unknown>> : [];
+      if (!updates.length) return this.err("updates must not be empty");
+      const seenTargets = new Set<string>();
+      for (const update of updates) {
+        const name = String(update.name ?? "");
+        const key = String(update.key ?? "");
+        const value = String(update.value ?? "");
+        const [pageErr, p] = this.readWritePage(name);
+        if (pageErr) return pageErr;
+        if (!key) return this.err("key is required");
+        const duplicateKey = `${rel(this.root, p)}\0${key}`;
+        if (seenTargets.has(duplicateKey)) return this.err(`duplicate batch update target: ${stem(p)} ${key}`);
+        seenTargets.add(duplicateKey);
+        const [allowed, schemaMsg] = this.checkSchema(key, Boolean(args.force));
+        if (!allowed) return this.err(schemaMsg!);
+        const [linkOk, linkMsg, dangling] = this.checkLinksResolve(value, Boolean(update.allow_dangling ?? args.allow_dangling));
+        if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+        target(p, "batch_update_property", `${key}:: ${value}`);
+      }
+      targetAudit();
+      return this.ok({ preview: { tool, update_count: updates.length, target_paths: targetPaths.map((p) => rel(this.root, p)) }, effects });
+    }
+    if (tool === "delete_property") {
+      const [pageErr, p] = this.readWritePage(String(args.name ?? ""));
+      if (pageErr) return pageErr;
+      const key = String(args.key ?? "");
+      if (!key) return this.err("key is required");
+      target(p, "delete_property", key);
+      targetAudit();
+      return this.ok({ preview: { tool, name: stem(p), key, target_paths: [rel(this.root, p)] }, effects });
+    }
+    if (tool === "append_contact_log") {
+      const name = String(args.name ?? "");
+      const medium = String(args.medium ?? "");
+      const summary = String(args.summary ?? "");
+      if (!medium || !summary) return this.err("medium and summary are required");
+      if (!parseDate(String(args.date))) return this.err(`invalid date ${JSON.stringify(args.date)}, expected YYYY-MM-DD`);
+      const [linkOk, linkMsg, dangling] = this.checkLinksResolve(summary, Boolean(args.allow_dangling));
+      if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+      const [pageErr, p] = this.readWritePage(name);
+      if (pageErr) return pageErr;
+      target(p, "append_contact_log", this.expectedAppendMarker(tool, args));
+      targetAudit();
+      return this.ok({ preview: { tool, name: stem(p), bullet: this.expectedAppendMarker(tool, args), target_paths: [rel(this.root, p)] }, effects });
+    }
+    if (tool === "append_journal_bullet") {
+      const content = String(args.content ?? "");
+      if (!content) return this.err("content is required");
+      if (args.date != null) {
+        const err = this.safeDate(String(args.date));
+        if (err) return this.err(err);
+      }
+      const [linkOk, linkMsg, dangling] = this.checkLinksResolve(content, Boolean(args.allow_dangling));
+      if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+      const date = toJournalDate(String(args.date));
+      const p = path.join(this.journals, `${date}.md`);
+      if (!this.under(p, this.journals)) return this.err("journal path escapes JOURNALS dir");
+      const sl = this.rejectSymlink(p);
+      if (sl) return sl;
+      target(p, "append_journal_bullet", this.expectedAppendMarker(tool, args));
+      targetAudit();
+      return this.ok({ preview: { tool, date: fromJournalDate(date), bullet: this.expectedAppendMarker(tool, args), target_paths: [rel(this.root, p)] }, effects });
+    }
+    if (tool === "create_stub") {
+      const name = String(args.name ?? "");
+      const safe = this.safeName(name);
+      if (safe) return this.err(safe);
+      if (this.findPagePath(name)) return this.err(`Page already exists: ${name}`);
+      const pageType = String(args.page_type ?? "person");
+      let props: Frontmatter = [["type", pageType], ["confidence", String(args.confidence ?? "low")]];
+      if (args.source != null) props.push(["source", String(args.source)]);
+      if (args.properties && typeof args.properties === "object" && !Array.isArray(args.properties)) {
+        for (const [k, v] of Object.entries(args.properties as Record<string, unknown>)) props = this.propsSet(props, k, String(v));
+      }
+      for (const [k] of props) {
+        const [ok, msg] = this.checkSchema(k, Boolean(args.force));
+        if (!ok) return this.err(msg!);
+      }
+      const notes = Array.isArray(args.notes) ? args.notes.map(String) : [];
+      if (pageType !== "redirect") {
+        const bundle = [args.source == null ? "" : String(args.source), ...Object.values((args.properties ?? {}) as Record<string, unknown>).map(String), ...notes].join("\n");
+        const [linkOk, linkMsg, dangling] = this.checkLinksResolve(bundle, Boolean(args.allow_dangling));
+        if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+      }
+      const p = path.join(this.pages, `${name}.md`);
+      target(p, "create_stub", `type:: ${String(args.page_type ?? "person")}`);
+      targetAudit();
+      return this.ok({ preview: { tool, name, target_paths: [rel(this.root, p)] }, effects });
+    }
+    if (tool === "rename_page") {
+      const [pageErr, p] = this.readWritePage(String(args.old_name ?? ""));
+      if (pageErr) return pageErr;
+      const newName = String(args.new_name ?? "");
+      const safe = this.safeName(newName, "new_name");
+      if (safe) return this.err(safe);
+      const dst = path.join(this.pages, `${newName}.md`);
+      if (!this.under(dst, this.pages)) return this.err("destination path escapes PAGES dir");
+      if (pathExists(dst) && fs.realpathSync.native(dst) !== fs.realpathSync.native(p)) return this.err(`Destination exists: ${newName}`);
+      if (this.isUnsafeCaseOnlyRename(p, dst)) {
+        return this.err("case-only rename on case-insensitive filesystem is unsafe; rename to a different intermediate first, then to the desired case");
+      }
+      target(p, "rename_page_source", String(args.new_name ?? ""));
+      target(dst, "rename_page_destination", readText(p).slice(0, 200));
+      targetAudit();
+      return this.ok({ preview: { tool, old_name: stem(p), new_name: newName, target_paths: targetPaths.map((x) => rel(this.root, x)) }, effects });
+    }
+    if (tool === "delete_page") {
+      const [pageErr, p] = this.readWritePage(String(args.name ?? ""));
+      if (pageErr) return pageErr;
+      if (fs.realpathSync.native(p) === fs.realpathSync.native(this.schemaFile)) return this.err("cannot delete schema page");
+      const bl = this.backlinks({ name: stem(p), include_aliases: false, mode: "summary", limit: 1000 });
+      const backlinkCount = bl.ok ? Number(bl.count ?? 0) : 0;
+      if (backlinkCount > 0 && !args.force_if_backlinks) {
+        return this.err(`page has ${backlinkCount} backlinks; pass force_if_backlinks=True to delete anyway or rename_page with a redirect instead`, { backlink_count: backlinkCount });
+      }
+      const now = new Date();
+      const archiveDir = path.join(this.root, "archive", String(now.getFullYear()).padStart(4, "0"), String(now.getMonth() + 1).padStart(2, "0"));
+      let archivePath = path.join(archiveDir, path.basename(p));
+      while (pathExists(archivePath)) archivePath = path.join(archiveDir, `${stem(p)}.${uniqueId().slice(0, 8)}.md`);
+      if (!this.under(archivePath, path.join(this.root, "archive"))) return this.err("archive path escapes archive dir");
+      target(p, "delete_page", stem(p));
+      target(archivePath, "delete_page_archive", readText(p).slice(0, 200));
+      targetAudit();
+      return this.ok({ preview: { tool, name: stem(p), target_paths: targetPaths.map((x) => rel(this.root, x)) }, effects });
+    }
+    if (tool === "update_body_section") {
+      const [pageErr, p] = this.readWritePage(String(args.name ?? ""));
+      if (pageErr) return pageErr;
+      const anchor = String(args.anchor ?? "");
+      const mode = String(args.mode ?? "replace_block");
+      const valid = new Set(["replace_block", "append_to_section", "prepend_to_section", "delete_block"]);
+      if (!anchor) return this.err("anchor is required");
+      if (!valid.has(mode)) return this.err(`mode must be one of ${JSON.stringify(Array.from(valid).sort())}, got ${JSON.stringify(mode)}`);
+      let newContent = args.new_content == null ? undefined : String(args.new_content);
+      if (mode === "delete_block") {
+        if (newContent != null && newContent !== "") return this.err("new_content must be omitted or empty for mode='delete_block'");
+        newContent = "";
+      } else {
+        if (newContent == null) return this.err(`new_content is required for mode=${JSON.stringify(mode)}`);
+        const [linkOk, linkMsg, dangling] = this.checkLinksResolve(newContent, Boolean(args.allow_dangling));
+        if (!linkOk) return this.err(linkMsg!, { dangling_targets: dangling });
+      }
+      target(p, "update_body_section", newContent);
+      targetAudit();
+      return this.ok({ preview: { tool, name: stem(p), mode, anchor, target_paths: [rel(this.root, p)] }, effects });
+    }
+    return this.err(`unsupported write intent tool: ${tool}`);
+  }
+
+  private flushOneWriteIntent(record: WriteIntentRecord): Record<string, unknown> {
+    if (record.state === "completed") return { ok: true, intent_id: record.op_id, state: record.state, intent: publicRecord(record), duplicate: true };
+    if (!["pending", "failed_retryable"].includes(record.state)) {
+      return { ok: false, intent_id: record.op_id, state: record.state, error: `cannot flush write intent in state ${record.state}` };
+    }
+    if (record.expires_at && Date.parse(record.expires_at) < Date.now()) {
+      const next = this.writeLedger.markTerminal(record, "expired", "write intent expired before flush");
+      return { ok: false, intent_id: record.op_id, state: next.state, error: next.last_error };
+    }
+    const args = JSON.parse(record.canonical_args_json) as Record<string, unknown>;
+    const already = this.intentAlreadyApplied(record.tool, args);
+    if (already.ok) {
+      const next = this.writeLedger.markCompleted(record, this.ok({ reconciled: true, already_applied: true, result: already }), null, true);
+      return { ok: true, intent_id: record.op_id, state: next.state, reconciled: true, intent: publicRecord(next) };
+    }
+    if (record.expected_base_head && this.gitInsideWorktree() && this.gitHead() !== record.expected_base_head) {
+      const next = this.writeLedger.markManual(record, "expected_base_head no longer matches graph HEAD", { current_head: this.gitHead() });
+      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
+    }
+    const precondition = this.checkIntentPreconditions(record);
+    if (!precondition.ok) {
+      const next = this.writeLedger.markManual(record, String(precondition.error), precondition);
+      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
+    }
+    const claim = this.writeLedger.claimForFlush(record, SERVER_WRITE_DEADLINE_MS);
+    if (!claim.claimed) {
+      const latest = claim.record;
+      if (latest.state === "completed") return { ok: true, intent_id: latest.op_id, state: latest.state, intent: publicRecord(latest), duplicate: true };
+      return { ok: false, intent_id: latest.op_id, state: latest.state, error: `write intent is already ${latest.state}` };
+    }
+    let applying = claim.record;
+    const effectsBefore = this.writeLedger.effects(record.op_id);
+    this.activeWriteIntent = { op_id: record.op_id, idempotency_key: record.idempotency_key, request_hash: record.request_hash, expected_paths: this.intentExpectedPaths(record, effectsBefore), effects: effectsBefore };
+    let result: ToolResult;
+    try {
+      result = this.executeRawWriteTool(record.tool, args);
+    } finally {
+      this.activeWriteIntent = null;
+    }
+    const commit = this.gitGuardCommit(result);
+    if (!result.ok) {
+      if (commit) {
+        const effectsAfter = effectsBefore.map((effect) => ({ ...effect, after_hash: fileSha256(path.join(this.root, effect.path)) }));
+        applying = this.writeLedger.markAppliedUncommitted(applying, effectsAfter);
+        const completed = this.writeLedger.markCompleted(applying, result, commit);
+        return {
+          ok: false,
+          intent_id: record.op_id,
+          state: completed.state,
+          intent: publicRecord(completed),
+          committed: true,
+          error: String(result.error ?? "write completed with partial failures"),
+          result,
+        };
+      }
+      const errorClass = this.classifyWriteError(String(result.error ?? ""));
+      const next = errorClass.retryable
+        ? this.writeLedger.markRetryable(applying, errorClass.name, String(result.error ?? "write failed"))
+        : this.writeLedger.markManual(applying, String(result.error ?? "write failed"), result);
+      return { ok: false, intent_id: record.op_id, state: next.state, error_class: next.last_error_class, error: next.last_error ?? next.manual_reason, result };
+    }
+    const effectsAfter = effectsBefore.map((effect) => ({ ...effect, after_hash: fileSha256(path.join(this.root, effect.path)) }));
+    applying = this.writeLedger.markAppliedUncommitted(applying, effectsAfter);
+    const completed = this.writeLedger.markCompleted(applying, result, commit || null);
+    return { ok: true, intent_id: record.op_id, state: completed.state, intent: publicRecord(completed), result };
+  }
+
+  private gitGuardCommit(result: ToolResult): string | null {
+    if (typeof result.git_guard !== "object" || !result.git_guard || !("commit" in result.git_guard)) return null;
+    const commit = String((result.git_guard as Record<string, unknown>).commit ?? "");
+    return commit || null;
+  }
+
+  private reconcileWriteIntents(): void {
+    const expired = this.writeLedger.recoverExpired();
+    const reconciling = [
+      ...expired,
+      ...this.writeLedger.list(["reconciling"], 200, 0).filter((record) => !expired.some((e) => e.op_id === record.op_id)),
+    ];
+    for (const record of reconciling) {
+      try {
+        this.reconcileOneWriteIntent(record);
+      } catch (err) {
+        const latest = this.writeLedger.get(record.op_id) ?? record;
+        this.writeLedger.markManual(latest, `reconciliation failed: ${(err as Error).message}`, {});
+      }
+    }
+  }
+
+  private reconcileOneWriteIntent(record: WriteIntentRecord): void {
+    const latest = this.writeLedger.get(record.op_id) ?? record;
+    const commit = this.findIntentCommit(latest);
+    if (commit) {
+      this.writeLedger.markCompleted(latest, this.ok({ reconciled: true, git_commit: commit }), commit, true);
+      return;
+    }
+
+    const args = JSON.parse(latest.canonical_args_json) as Record<string, unknown>;
+    const already = this.intentAlreadyApplied(latest.tool, args);
+    const effects = this.writeLedger.effects(latest.op_id);
+    const allAtBase = effects.every((effect) => fileSha256(path.join(this.root, effect.path)) === effect.expected_base_hash);
+    if (allAtBase && latest.state === "reconciling") {
+      this.writeLedger.markPending(latest, "reconciled_no_file_effects", {});
+      return;
+    }
+
+    const dirty = this.gitInsideWorktree() ? this.gitStatusEntries() : [];
+    const expectedPaths = new Set(effects.map((effect) => effect.path));
+    const dirtyPaths = Array.from(new Set(dirty.flatMap((entry) => [entry.path, entry.old_path]).filter(Boolean)));
+    const unexpectedDirty = dirtyPaths.filter((p) => !expectedPaths.has(p));
+    if (unexpectedDirty.length) {
+      this.writeLedger.markManual(latest, "unexpected dirty paths during reconciliation", { unexpected_dirty_paths: unexpectedDirty.slice(0, 20) });
+      return;
+    }
+
+    if (dirtyPaths.length && this.recoveryEffectsMatch(latest, args, effects, already)) {
+      const commitHash = this.commitRecoveredIntent(latest, dirtyPaths);
+      this.writeLedger.markCompleted(latest, this.ok({ reconciled: true, git_commit: commitHash, committed_paths: dirtyPaths }), commitHash, true);
+      return;
+    }
+
+    if (already.ok) {
+      this.writeLedger.markCompleted(latest, this.ok({ reconciled: true, already_applied: true, result: already }), null, true);
+      return;
+    }
+
+    this.writeLedger.markManual(latest, "unable to reconcile expired write intent", { dirty_paths: dirtyPaths, effects });
+  }
+
+  private recoveryEffectsMatch(record: WriteIntentRecord, args: Record<string, unknown>, effects: WriteIntentEffect[], already: ToolResult): boolean {
+    if (record.tool === "regenerate_index") return effects.every((effect) => effect.path === "generated/graph_index.json" && fileSha256(path.join(this.root, effect.path)) !== effect.expected_base_hash);
+    if (already.ok) return true;
+    if (record.tool === "delete_page") {
+      const source = effects.find((effect) => effect.effect_type === "delete_page");
+      const archive = effects.find((effect) => effect.effect_type === "delete_page_archive");
+      return Boolean(source && archive && fileSha256(path.join(this.root, source.path)) === null && fileSha256(path.join(this.root, archive.path)) === source.expected_base_hash);
+    }
+    if (record.tool === "rename_page" && args.leave_redirect === false) {
+      const source = effects.find((effect) => effect.effect_type === "rename_page_source");
+      const destination = effects.find((effect) => effect.effect_type === "rename_page_destination");
+      return Boolean(source && destination && fileSha256(path.join(this.root, source.path)) === null && fileSha256(path.join(this.root, destination.path)) === source.expected_base_hash);
+    }
+    const markerEffects = effects.filter((effect) => effect.applied_marker);
+    return markerEffects.length > 0 && markerEffects.every((effect) => this.effectMarkerExists(effect));
+  }
+
+  private findIntentCommit(record: WriteIntentRecord): string | null {
+    if (!this.gitInsideWorktree()) return null;
+    let log = "";
+    try {
+      log = this.gitOk(["log", "HEAD", "-n", "200", "--format=%H%x1f%B%x1e"], 60000);
+    } catch {
+      return null;
+    }
+    for (const entry of log.split("\x1e")) {
+      if (!entry.trim()) continue;
+      const sep = entry.indexOf("\x1f");
+      const commit = sep >= 0 ? entry.slice(0, sep).trim() : "";
+      const body = sep >= 0 ? entry.slice(sep + 1) : entry;
+      if (
+        commit
+        && body.includes(`op_id: ${record.op_id}`)
+        && body.includes(`idempotency_key: ${record.idempotency_key}`)
+        && body.includes(`request_hash: ${record.request_hash}`)
+      ) {
+        return commit;
+      }
+    }
+    return null;
+  }
+
+  private commitRecoveredIntent(record: WriteIntentRecord, paths: string[]): string {
+    if (!this.gitInsideWorktree()) throw new Error("cannot reconcile commit outside a Git worktree");
+    const lock = this.acquireGitGuardLock(record.op_id);
+    try {
+      const dirty = this.gitStatusEntries();
+      const expected = new Set(paths);
+      const currentPaths = Array.from(new Set(dirty.flatMap((entry) => [entry.path, entry.old_path]).filter(Boolean))).sort();
+      const unexpected = currentPaths.filter((p) => !expected.has(p));
+      if (unexpected.length) throw new Error(`unexpected dirty paths during recovery commit: ${unexpected.join(", ")}`);
+      this.gitOk(["add", "-A", "--", ...currentPaths], 60000);
+      const subject = `mcp-logseq: recover ${record.tool} ${record.op_id.slice(0, 12)}`;
+      this.gitOk([
+        "commit",
+        "--author",
+        this.gitCommitAuthor,
+        "-m",
+        subject,
+        "-m",
+        `tool: ${record.tool}`,
+        "-m",
+        `op_id: ${record.op_id}`,
+        "-m",
+        `idempotency_key: ${record.idempotency_key}`,
+        "-m",
+        `request_hash: ${record.request_hash}`,
+        "-m",
+        `before_head: ${record.git_before_head ?? ""}`,
+        "-m",
+        `reconciled: true`,
+        "--",
+        ...currentPaths,
+      ], 60000);
+      return this.gitHead();
+    } finally {
+      lock.release();
+    }
+  }
+
+  private acquireGitGuardLock(opId: string): LockHandle {
+    const lockPath = path.join(this.root, ".mcp-git-guard.lock");
+    const deadline = Date.now() + this.lockTimeoutMs;
+    while (true) {
+      try {
+        const fd = fs.openSync(lockPath, "wx", 0o644);
+        fs.writeFileSync(fd, `${JSON.stringify(lockMetadata(this.root, this.lockTimeoutMs, opId), null, 2)}\n`, "utf8");
+        return new LockHandle(lockPath, fd);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() > deadline) throw err;
+        sleepMs(50);
+      }
+    }
+  }
+
+  private executeRawWriteTool(tool: string, args: Record<string, unknown>): ToolResult {
+    switch (tool) {
+      case "update_property": return this.update_property(args);
+      case "batch_update_property": return this.batch_update_property(args);
+      case "delete_property": return this.delete_property(String(args.name ?? ""), String(args.key ?? ""));
+      case "append_contact_log": return this.append_contact_log(args);
+      case "append_journal_bullet": return this.append_journal_bullet(args);
+      case "create_stub": return this.create_stub(args);
+      case "rename_page": return this.rename_page(String(args.old_name ?? ""), String(args.new_name ?? ""), args.leave_redirect !== false);
+      case "delete_page": return this.delete_page(String(args.name ?? ""), Boolean(args.force_if_backlinks));
+      case "update_body_section": return this.update_body_section(args);
+      case "regenerate_index": return this.regenerate_index();
+      default: return this.err(`unsupported write intent tool: ${tool}`);
+    }
+  }
+
+  private intentExpectedPaths(record: WriteIntentRecord, effects: WriteIntentEffect[]): Set<string> {
+    return new Set(effects.map((effect) => effect.path));
+  }
+
+  private checkIntentPreconditions(record: WriteIntentRecord): ToolResult {
+    for (const effect of this.writeLedger.effects(record.op_id)) {
+      if (effect.effect_type === "audit_journal") continue;
+      const fullPath = path.join(this.root, effect.path);
+      const currentHash = fileSha256(fullPath);
+      if (currentHash !== effect.expected_base_hash) {
+        return this.err(`target changed since intent submission: ${effect.path}`, {
+          error_class: "precondition_conflict",
+          path: effect.path,
+          expected_base_hash: effect.expected_base_hash,
+          current_hash: currentHash,
+        });
+      }
+    }
+    return this.ok();
+  }
+
+  private effectMarkerExists(effect: WriteIntentEffect): boolean {
+    if (!effect.applied_marker) return false;
+    const fullPath = path.join(this.root, effect.path);
+    try {
+      return readText(fullPath).includes(effect.applied_marker);
+    } catch {
+      return false;
+    }
+  }
+
+  private intentAlreadyApplied(tool: string, args: Record<string, unknown>): ToolResult {
+    if (tool === "update_property") {
+      const p = this.findPagePath(String(args.name ?? ""));
+      if (!p) return this.err("not applied");
+      const props = this.propsDict(this.splitFrontmatter(readText(p))[0]);
+      return props[String(args.key ?? "")] === String(args.value ?? "") ? this.ok({ name: stem(p), key: String(args.key ?? "") }) : this.err("not applied");
+    }
+    if (tool === "delete_property") {
+      const p = this.findPagePath(String(args.name ?? ""));
+      const key = String(args.key ?? "");
+      if (!p || !key) return this.err("not applied");
+      const props = this.propsDict(this.splitFrontmatter(readText(p))[0]);
+      return props[key] == null ? this.ok({ name: stem(p), key, property_absent: true }) : this.err("not applied");
+    }
+    if (tool === "update_body_section") {
+      const p = this.findPagePath(String(args.name ?? ""));
+      if (!p) return this.err("not applied");
+      if (String(args.mode ?? "replace_block") === "delete_block") return this.err("not applied");
+      if (this.bodySectionAlreadyApplied(p, args)) return this.ok({ marker: this.expectedAppendMarker(tool, args) });
+    }
+    if (tool === "append_contact_log") {
+      const p = this.findPagePath(String(args.name ?? ""));
+      if (p && pathExists(p) && this.contactLogAlreadyApplied(p, args)) return this.ok({ marker: this.expectedAppendMarker(tool, args) });
+    }
+    if (tool === "append_journal_bullet" && this.journalBulletAlreadyApplied(args)) return this.ok({ marker: this.expectedAppendMarker(tool, args) });
+    if (tool === "create_stub") {
+      const p = this.findPagePath(String(args.name ?? ""));
+      if (p && this.createStubAlreadyApplied(p, args)) return this.ok({ name: String(args.name ?? "") });
+    }
+    return this.err("not applied");
+  }
+
+  private bodySectionAlreadyApplied(p: string, args: Record<string, unknown>): boolean {
+    const marker = this.expectedAppendMarker("update_body_section", args);
+    if (!marker) return false;
+    const mode = String(args.mode ?? "replace_block");
+    const anchor = String(args.anchor ?? "");
+    const [, body] = this.splitFrontmatter(readText(p));
+    const block = this.bodyBlockForAnchor(body, anchor);
+    if (!block) return false;
+    return block.includes(marker);
+  }
+
+  private bodyBlockForAnchor(body: string, anchor: string): string | null {
+    if (!anchor) return null;
+    const lines = body.split("\n");
+    const matches = lines.map((line, i) => line.includes(anchor) ? i : -1).filter((i) => i >= 0);
+    if (matches.length !== 1) return null;
+    const anchorIdx = matches[0]!;
+    const anchorLine = lines[anchorIdx]!;
+    const anchorIndent = anchorLine.length - anchorLine.replace(/^\t+/, "").length;
+    let blockEnd = anchorIdx + 1;
+    while (blockEnd < lines.length) {
+      const line = lines[blockEnd]!;
+      if (!line.trimEnd()) {
+        blockEnd += 1;
+        continue;
+      }
+      const indent = line.length - line.replace(/^\t+/, "").length;
+      if (indent <= anchorIndent) break;
+      blockEnd += 1;
+    }
+    return lines.slice(anchorIdx, blockEnd).join("\n");
+  }
+
+  private journalBulletAlreadyApplied(args: Record<string, unknown>): boolean {
+    const marker = this.expectedAppendMarker("append_journal_bullet", args);
+    if (!marker) return false;
+    const p = path.join(this.journals, `${toJournalDate(String(args.date))}.md`);
+    if (!pathExists(p)) return false;
+    const text = readText(p);
+    const section = args.section == null ? null : String(args.section);
+    if (!section) {
+      const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`^- ${escapedMarker}\\s*$`, "m").test(text);
+    }
+    const escaped = section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`^- ## ${escaped}\\s*$`, "m");
+    const m = re.exec(text);
+    if (!m) return false;
+    const after = text.slice(m.index + m[0].length);
+    const nextSection = after.search(/\n- ## /);
+    const sectionText = nextSection >= 0 ? after.slice(0, nextSection) : after;
+    return sectionText.includes(`\t- ${marker}`);
+  }
+
+  private contactLogAlreadyApplied(p: string, args: Record<string, unknown>): boolean {
+    const marker = this.expectedAppendMarker("append_contact_log", args);
+    if (!marker) return false;
+    const [props, body] = this.splitFrontmatter(readText(p));
+    const m = /^- \*\*Contact log\*\*[^\n]*\n/m.exec(body);
+    if (!m) return false;
+    const after = body.slice(m.index + m[0].length);
+    const nextBlock = after.search(/\n- /);
+    const sectionText = nextBlock >= 0 ? after.slice(0, nextBlock) : after;
+    if (!sectionText.includes(`\t- ${marker}`)) return false;
+    const intentDate = parseDate(String(args.date ?? nowIsoDate()));
+    const lastContacted = parseDate(this.propsDict(props)["last-contacted"]);
+    return !intentDate || Boolean(lastContacted && lastContacted >= intentDate);
+  }
+
+  private createStubAlreadyApplied(p: string, args: Record<string, unknown>): boolean {
+    const [props, body] = this.splitFrontmatter(readText(p));
+    const dict = this.propsDict(props);
+    if (dict.type !== String(args.page_type ?? "person")) return false;
+    if (dict.confidence !== String(args.confidence ?? "low")) return false;
+    if (args.source != null && dict.source !== String(args.source)) return false;
+    if (args.properties && typeof args.properties === "object" && !Array.isArray(args.properties)) {
+      for (const [key, value] of Object.entries(args.properties as Record<string, unknown>)) {
+        if (dict[key] !== String(value)) return false;
+      }
+    }
+    const notes = Array.isArray(args.notes) ? args.notes.map(String) : [];
+    return notes.every((note) => body.includes(note));
+  }
+
+  private expectedAppendMarker(tool: string, args: Record<string, unknown>): string {
+    if (tool === "append_contact_log") {
+      const bits = [
+        String(args.date ?? nowIsoDate()),
+        String(args.medium ?? ""),
+        args.direction ? String(args.direction) : "",
+        String(args.summary ?? ""),
+        args.duration ? String(args.duration) : "",
+      ].filter(Boolean);
+      return bits.join(" - ");
+    }
+    if (tool === "append_journal_bullet") return String(args.content ?? "");
+    if (tool === "update_body_section") return String(args.new_content ?? "");
+    return "";
+  }
+
+  private classifyWriteError(error: string): { name: string; retryable: boolean } {
+    if (/lock|timeout|timed out|EAGAIN|EBUSY/i.test(error)) return { name: "lock_timeout", retryable: true };
+    if (/requires a clean Logseq graph|dirty/i.test(error)) return { name: "guard_blocked_dirty_graph", retryable: true };
+    if (/not in schema|dangling wikilink|anchor not found|anchor matched|Page not found|invalid date|force is disabled/i.test(error)) return { name: "validation_failed", retryable: false };
+    if (/blast-radius|delete violation/i.test(error)) return { name: "blast_radius_violation", retryable: false };
+    return { name: "write_failed", retryable: false };
   }
 
   list_pages(args: Record<string, unknown> = {}): ToolResult {
@@ -738,8 +1560,17 @@ export class LogseqServer {
     return this.cap(this.ok({
       root: this.root,
       readonly: this.readonlyMode,
+      write_mode: this.writeMode,
+      package_version: packageVersion,
       schema_mode: this.schemaMode,
+      link_mode: this.linkMode,
+      disallow_force: this.disallowForce,
       git_guard_mode: this.gitGuardMode,
+      git_guard_limits: {
+        max_changed_files: this.gitMaxChangedFiles,
+        max_deleted_files: this.gitMaxDeletedFiles,
+        ignore_dirs: this.gitGuardIgnoreDirs,
+      },
       pages: pagePaths.length,
       journals: journalPaths.length,
       generated_index: {
@@ -761,6 +1592,11 @@ export class LogseqServer {
       cache: {
         file: this.persistentCache.cacheFile,
         watcher_enabled: this.watcher !== null,
+      },
+      locks: this.lockHealth(limit),
+      write_intents: {
+        ledger_file: this.writeLedger.ledgerFile,
+        counts: this.writeLedger.counts(),
       },
     }));
   }
@@ -1457,7 +2293,8 @@ export class LogseqServer {
     if (backlinkCount > 0 && !forceIfBacklinks) return this.err(`page has ${backlinkCount} backlinks; pass force_if_backlinks=True to delete anyway or rename_page with a redirect instead`, { backlink_count: backlinkCount });
     const now = new Date();
     const archiveDir = path.join(this.root, "archive", String(now.getFullYear()).padStart(4, "0"), String(now.getMonth() + 1).padStart(2, "0"));
-    let archivePath = path.join(archiveDir, path.basename(p));
+    const plannedArchiveRel = this.activeWriteIntent?.effects.find((effect) => effect.effect_type === "delete_page_archive")?.path ?? null;
+    let archivePath = plannedArchiveRel ? path.join(this.root, plannedArchiveRel) : path.join(archiveDir, path.basename(p));
     if (!this.under(archivePath, path.join(this.root, "archive"))) return this.err("archive path escapes archive dir");
     let txn: GitTxn;
     try {
@@ -1467,8 +2304,11 @@ export class LogseqServer {
     }
     try {
       this.withLock(p, () => {
-        fs.mkdirSync(archiveDir, { recursive: true });
-        if (pathExists(archivePath)) archivePath = path.join(archiveDir, `${stem(p)}.${uniqueId().slice(0, 8)}.md`);
+        fs.mkdirSync(path.dirname(archivePath), { recursive: true });
+        if (pathExists(archivePath)) {
+          if (plannedArchiveRel) throw new Error(`planned archive target already exists: ${rel(this.root, archivePath)}`);
+          archivePath = path.join(archiveDir, `${stem(p)}.${uniqueId().slice(0, 8)}.md`);
+        }
         fs.renameSync(p, archivePath);
       });
     } catch (e) {

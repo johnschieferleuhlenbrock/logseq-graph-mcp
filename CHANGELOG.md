@@ -4,6 +4,17 @@ All notable changes to this package will be documented in this file.
 
 This project follows semantic versioning.
 
+## 0.2.0 - 2026-06-02
+
+- Add server-owned durable write intents with idempotency keys, explicit flush,
+  status/cancel tools, and SQLite operation ledger storage outside the graph.
+- Make `LOGSEQ_WRITE_MODE=intent` the default write-capable surface; raw
+  mutating tools are hidden unless `LOGSEQ_WRITE_MODE=admin_raw`.
+- Extend `graph_status` with write mode, ledger counts, lock metadata, and
+  expanded guard configuration.
+- Add metadata lockfiles and include safe-write operation metadata in git
+  checkpoint commits.
+
 ## 0.1.2 - 2026-05-31
 
 - Keep MCP `initialize` server metadata in sync with the package version.

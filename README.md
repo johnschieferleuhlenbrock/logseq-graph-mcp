@@ -103,7 +103,15 @@ Read tools:
 - `query_pages`
 - `graph_status`
 
-Write tools:
+Safe write tools (default write-capable surface):
+
+- `submit_write_intent`
+- `flush_write_intents`
+- `get_write_intent`
+- `list_write_intents`
+- `cancel_write_intent`
+
+Raw write tools (`LOGSEQ_WRITE_MODE=admin_raw` only):
 
 - `update_property`
 - `batch_update_property`
@@ -124,11 +132,10 @@ Analysis and meta tools:
 - `graph_stats`
 - `find_components`
 - `find_dangling_links`
-- `regenerate_index`
+- `regenerate_index` (raw/admin only; submit it as a safe-write intent in default mode)
 
 All tool payloads use `{ "ok": true, ... }` or `{ "ok": false, "error": "..." }`.
-MCP clients wrap tool output in a `content` array; parse the JSON text content
-to inspect the payload.
+MCP clients that negotiate protocol `2025-06-18` or newer receive both `structuredContent` and a JSON text item in `content`; older clients receive the JSON text item only.
 
 ## Safety Model
 
@@ -136,12 +143,15 @@ The server is designed for local subprocess execution under the current user.
 It should not be exposed as a remote service without a separate authentication
 and authorization layer.
 
-- `LOGSEQ_READONLY=1` disables every mutating tool before it touches files.
+- `LOGSEQ_READONLY=1` or `LOGSEQ_WRITE_MODE=readonly` exposes read tools only.
+- `LOGSEQ_WRITE_MODE=intent` is the default write-capable mode. Agents submit durable write intents and flush explicit intent IDs; raw mutating tools are hidden.
+- `LOGSEQ_WRITE_MODE=admin_raw` exposes raw mutating tools for local admin/debug use.
+- Safe writes persist an operation ledger outside the graph, enforce idempotency keys, revalidate preconditions before mutation, and record git checkpoint metadata.
 - `LOGSEQ_VALIDATE_SCHEMA=block|warn|off` controls property-key validation.
 - `LOGSEQ_DISALLOW_FORCE=1` rejects forced schema bypasses.
 - `LOGSEQ_VALIDATE_LINKS=block|warn|off` controls dangling wikilink validation.
 - `LOGSEQ_GIT_GUARD=strict|warn|off` controls clean-tree checks, blast-radius enforcement, and checkpoint commits.
-- Writes use lockfiles plus atomic temp-file replacement.
+- Writes use metadata lockfiles plus atomic temp-file replacement.
 - Writes re-read target files inside the lock before mutating.
 - Mutations are append-style or property-level where possible.
 - `delete_page` moves pages into `archive/YYYY/MM/` instead of deleting content.
@@ -171,6 +181,7 @@ Proceed only when the reported Git state and generated-index state are expected.
 | --- | --- | --- |
 | `LOGSEQ_ROOT` | package directory fallback | Graph root containing `pages/` |
 | `LOGSEQ_READONLY` | unset | Set `1` to refuse all writes |
+| `LOGSEQ_WRITE_MODE` | `intent` | `readonly`, `intent`, or `admin_raw`; raw mutating tools are hidden unless `admin_raw` |
 | `LOGSEQ_VALIDATE_SCHEMA` | `block` | `block`, `warn`, or `off` |
 | `LOGSEQ_DISALLOW_FORCE` | unset | Set `1` to reject force bypass |
 | `LOGSEQ_VALIDATE_LINKS` | `block` | `block`, `warn`, or `off` |

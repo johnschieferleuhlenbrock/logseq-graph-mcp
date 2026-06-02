@@ -22,6 +22,8 @@ export async function runStdioServer(server = new LogseqServer()): Promise<void>
   for (const line of server.startupDiagnostics()) console.error(line);
 
   const rl = readline.createInterface({ input: stdin, crlfDelay: Infinity });
+  let protocolVersion = "2024-11-05";
+  let structuredContentEnabled = false;
   for await (const raw of rl) {
     const line = raw.trim();
     if (!line) continue;
@@ -39,11 +41,14 @@ export async function runStdioServer(server = new LogseqServer()): Promise<void>
 
     try {
       if (req.method === "initialize") {
+        const requestedProtocol = typeof req.params?.protocolVersion === "string" ? req.params.protocolVersion : "2024-11-05";
+        structuredContentEnabled = requestedProtocol >= "2025-06-18";
+        protocolVersion = structuredContentEnabled ? requestedProtocol : "2024-11-05";
         send({
           jsonrpc: "2.0",
           id: req.id,
           result: {
-            protocolVersion: "2024-11-05",
+            protocolVersion,
             capabilities: { tools: {} },
             serverInfo: { name: packageName, version: packageVersion },
             instructions: "Local-only stdio MCP server for safe access to a Logseq markdown graph.",
@@ -58,7 +63,9 @@ export async function runStdioServer(server = new LogseqServer()): Promise<void>
           ? params.arguments as Record<string, unknown>
           : {};
         const result = server.callTool(name, args);
-        send({ jsonrpc: "2.0", id: req.id, result: { content: toolContent(result), isError: !result.ok } });
+        const response: Record<string, unknown> = { content: toolContent(result), isError: !result.ok };
+        if (structuredContentEnabled) response.structuredContent = result;
+        send({ jsonrpc: "2.0", id: req.id, result: response });
       } else {
         send({ jsonrpc: "2.0", id: req.id, error: { code: -32601, message: `Method not found: ${req.method ?? ""}` } });
       }

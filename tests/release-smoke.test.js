@@ -85,7 +85,7 @@ test("package tarball installs, imports, and exposes the CLI bin", () => {
     assert.equal(fs.existsSync(tarball), true);
 
     fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ private: true, type: "module" }), "utf8");
-    runOk(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], { cwd: installDir, timeout: 120000 });
+    runOk(npm, ["install", "--no-audit", "--no-fund", tarball], { cwd: installDir, timeout: 120000 });
 
     const bin = path.join(installDir, "node_modules", ".bin", process.platform === "win32" ? "logseq-graph-mcp.cmd" : "logseq-graph-mcp");
     assert.equal(fs.existsSync(bin), true);
@@ -124,7 +124,7 @@ test("package tarball installs, imports, and exposes the CLI bin", () => {
   }
 });
 
-test("installed stdio server initializes, lists tools, and blocks readonly writes", () => {
+test("installed stdio server initializes, lists tools, and hides readonly writes", () => {
   const packDir = fs.mkdtempSync(path.join(os.tmpdir(), "logseq-mcp-pack-"));
   const installDir = fs.mkdtempSync(path.join(os.tmpdir(), "logseq-mcp-install-"));
   const root = makeGraph();
@@ -132,7 +132,7 @@ test("installed stdio server initializes, lists tools, and blocks readonly write
     const pack = npmPack(["--pack-destination", packDir]);
     const tarball = path.join(packDir, pack.filename);
     fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ private: true, type: "module" }), "utf8");
-    runOk(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball], { cwd: installDir, timeout: 120000 });
+    runOk(npm, ["install", "--no-audit", "--no-fund", tarball], { cwd: installDir, timeout: 120000 });
 
     const cli = path.join(installDir, "node_modules", "logseq-graph-mcp", "dist", "cli.js");
     const payload = [
@@ -153,10 +153,11 @@ test("installed stdio server initializes, lists tools, and blocks readonly write
     assert.deepEqual(initialize.serverInfo, { name: "logseq-graph-mcp", version: expectedPackageVersion });
     const tools = responses.find((entry) => entry.id === 2).result.tools.map((tool) => tool.name);
     assert.equal(tools.includes("graph_status"), true);
-    assert.equal(tools.includes("create_stub"), true);
+    assert.equal(tools.includes("create_stub"), false);
+    assert.equal(tools.includes("submit_write_intent"), false);
     const write = responses.find((entry) => entry.id === 3).result;
     assert.equal(write.isError, true);
-    assert.match(write.content[0].text, /LOGSEQ_READONLY/);
+    assert.match(write.content[0].text, /unknown tool/);
     assert.doesNotMatch(res.stdout, new RegExp("/" + "Users/" + "jo" + "hnsu|Claude/" + "projects"));
     assert.equal(status(root), "");
   } finally {
