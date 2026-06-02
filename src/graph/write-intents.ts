@@ -70,6 +70,10 @@ export type SubmitIntentInput = {
   preview: Record<string, unknown>;
 };
 
+export type IntentSubmissionLookupInput = Pick<SubmitIntentInput,
+  "idempotencyKey" | "tool" | "canonicalArgs" | "caller" | "expectedBaseHead" | "expiresAt"
+>;
+
 export type LedgerCounts = {
   by_state: Record<string, number>;
   oldest_pending_age_seconds: number | null;
@@ -148,16 +152,7 @@ export class WriteIntentLedger {
   }
 
   submit(input: SubmitIntentInput): { record: WriteIntentRecord; duplicate: boolean; conflict: boolean; preview: Record<string, unknown> } {
-    const scope = this.scope(input.caller, input.tool, input.idempotencyKey);
-    const requestPayload = {
-      graph_scope: scope.graph,
-      caller: input.caller,
-      tool: input.tool,
-      arguments: input.canonicalArgs,
-      expected_base_head: input.expectedBaseHead,
-      expires_at: input.expiresAt,
-    };
-    const requestHash = sha256(canonicalizeJson(requestPayload));
+    const { scope, requestHash } = this.submissionIdentity(input);
     const existing = this.getByIdempotency(scope.key);
     if (existing) {
       return {
@@ -193,6 +188,18 @@ export class WriteIntentLedger {
     });
     tx();
     return { record: this.get(opId)!, duplicate: false, conflict: false, preview: input.preview };
+  }
+
+  lookupSubmission(input: IntentSubmissionLookupInput): { record: WriteIntentRecord; duplicate: boolean; conflict: boolean; preview: Record<string, unknown> } | null {
+    const { scope, requestHash } = this.submissionIdentity(input);
+    const existing = this.getByIdempotency(scope.key);
+    if (!existing) return null;
+    return {
+      record: existing,
+      duplicate: existing.request_hash === requestHash,
+      conflict: existing.request_hash !== requestHash,
+      preview: parseJsonRecord(existing.response_json).preview as Record<string, unknown> ?? {},
+    };
   }
 
   get(id: string): WriteIntentRecord | null {
@@ -450,6 +457,19 @@ export class WriteIntentLedger {
   private scope(caller: string, tool: string, key: string): { graph: string; key: string } {
     const graph = sha256(path.resolve(this.ledgerFile)).slice(0, 16);
     return { graph, key: `${graph}:${caller || "unknown"}:${tool}:${key}` };
+  }
+
+  private submissionIdentity(input: IntentSubmissionLookupInput): { scope: { graph: string; key: string }; requestHash: string } {
+    const scope = this.scope(input.caller, input.tool, input.idempotencyKey);
+    const requestPayload = {
+      graph_scope: scope.graph,
+      caller: input.caller,
+      tool: input.tool,
+      arguments: input.canonicalArgs,
+      expected_base_head: input.expectedBaseHead,
+      expires_at: input.expiresAt,
+    };
+    return { scope, requestHash: sha256(canonicalizeJson(requestPayload)) };
   }
 
   private migrate(): void {

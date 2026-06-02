@@ -632,6 +632,23 @@ export class LogseqServer {
     const normalized = this.normalizeWriteIntentArgs(tool, rawArguments);
     if (!normalized.ok) return normalized;
     const canonicalArgs = normalized.arguments as Record<string, unknown>;
+    const existing = this.writeLedger.lookupSubmission({
+      idempotencyKey,
+      tool,
+      canonicalArgs,
+      caller,
+      expectedBaseHead,
+      expiresAt,
+    });
+    if (existing) {
+      if (existing.conflict) {
+        return this.err("idempotency_conflict: same idempotency_key was used with different arguments", {
+          error_class: "idempotency_conflict",
+          intent: publicRecord(existing.record),
+        });
+      }
+      return this.ok({ intent: publicRecord(existing.record), duplicate: true, preview: existing.preview });
+    }
     const validation = this.validateWriteIntent(tool, canonicalArgs);
     if (!validation.ok) return validation;
     const preview = validation.preview as Record<string, unknown>;

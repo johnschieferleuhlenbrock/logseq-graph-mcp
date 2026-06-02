@@ -40,10 +40,6 @@ function installFakeDate(iso) {
   };
 }
 
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function assertStrictObjectSchemas(schema, label) {
   if (!schema || typeof schema !== "object") return;
   if (schema.type === "object" && "properties" in schema) {
@@ -716,6 +712,16 @@ test("safe delete_page intent flushes through planned suffixed archive path", ()
   assert.equal(flush.results[0].result.archived_path, archiveEffect.path);
   assert.equal(fs.existsSync(path.join(root, archiveEffect.path)), true);
   assert.equal(status(root), "");
+  const duplicate = s.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-page-suffixed-archive",
+    tool: "delete_page",
+    arguments: { name: "Bad Date" },
+    caller: "test",
+  });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.intent.intent_id, submit.intent.intent_id);
+  assert.equal(duplicate.intent.state, "completed");
   s.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1033,13 +1039,14 @@ test("write intent polling recovers leases that expire after startup", () => {
     caller: "test",
   });
   assert.equal(submit.ok, true);
-  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), 20);
+  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), 60_000);
   assert.equal(started.state, "applying");
   s.close();
 
   const restarted = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
   assert.equal(restarted.writeLedger.get(submit.intent.intent_id).state, "applying");
-  sleepSync(30);
+  restarted.writeLedger.db.prepare("UPDATE operations SET lease_expires_at = ? WHERE op_id = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), submit.intent.intent_id);
   const intent = restarted.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
   assert.equal(intent.state, "pending");
   assert.equal(status(root), "");
