@@ -1269,7 +1269,8 @@ export class LogseqServer {
     const after = body.slice(m.index + m[0].length);
     const nextBlock = after.search(/\n- /);
     const sectionText = nextBlock >= 0 ? after.slice(0, nextBlock) : after;
-    if (!sectionText.includes(`\t- ${marker}`)) return false;
+    const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (!new RegExp(`^\t- ${escapedMarker}\\s*$`, "m").test(sectionText)) return false;
     const intentDate = parseDate(String(args.date ?? nowIsoDate()));
     const lastContacted = parseDate(this.propsDict(props)["last-contacted"]);
     return !intentDate || Boolean(lastContacted && lastContacted >= intentDate);

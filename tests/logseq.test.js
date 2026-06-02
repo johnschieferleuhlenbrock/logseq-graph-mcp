@@ -396,6 +396,18 @@ test("safe contact log idempotency is scoped to the contact log section", () => 
   const page = s.read_page("Alice");
   assert.equal(page.properties["last-contacted"], "2026-05-20");
   assert.match(page.body, /- \*\*Contact log\*\* \(newest first\)\n\t- 2026-05-20 - email - caught up/);
+
+  const prefixSubmit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:contact-log-prefix-is-not-applied",
+    tool: "append_contact_log",
+    arguments: { name: "Alice", medium: "email", summary: "caught", date: "2026-05-20" },
+    caller: "test",
+  });
+  assert.equal(prefixSubmit.ok, true);
+  const prefixFlush = s.callTool("flush_write_intents", { intent_ids: [prefixSubmit.intent.intent_id] });
+  assert.equal(prefixFlush.results[0].ok, true);
+  const updated = s.read_page("Alice");
+  assert.match(updated.body, /- \*\*Contact log\*\* \(newest first\)\n\t- 2026-05-20 - email - caught\n\t- 2026-05-20 - email - caught up/);
   assert.equal(status(root), "");
   s.close();
   fs.rmSync(root, { recursive: true, force: true });
