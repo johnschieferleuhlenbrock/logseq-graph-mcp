@@ -1213,7 +1213,10 @@ export class LogseqServer {
     const [, body] = this.splitFrontmatter(readText(p));
     const block = this.bodyBlockForAnchor(body, anchor);
     if (!block) return false;
-    return block.includes(marker);
+    if (mode === "replace_block") return block.trimEnd() === marker.trimEnd();
+    const wanted = marker.replace(/\r\n/g, "\n").trimEnd().split("\n");
+    const lines = block.replace(/\r\n/g, "\n").split("\n");
+    return wanted.length > 0 && lines.some((_, i) => wanted.every((line, offset) => lines[i + offset] === line));
   }
 
   private bodyBlockForAnchor(body: string, anchor: string): string | null {

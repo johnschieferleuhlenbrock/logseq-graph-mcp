@@ -415,7 +415,7 @@ test("safe contact log idempotency is scoped to the contact log section", () => 
 
 test("safe append idempotency is scoped to body anchors and journal sections", () => {
   const root = makeGraph();
-  writePage(root, "Scoped Body", "type:: note\n\n- Other\n\t- duplicate line\n- Target\n\t- existing\n");
+  writePage(root, "Scoped Body", "type:: note\n\n- Other\n\t- duplicate line\n- Target\n\t- existing\n\t- callback\n");
   fs.writeFileSync(path.join(root, "journals", "2026_06_03.md"), "- ## Other\n\t- duplicate bullet\n- ## duplicate top bullet\n- ## Target\n\t- existing\n\t- callback\n", "utf8");
   run("git", ["add", "-A"], root);
   run("git", ["commit", "-q", "-m", "add scoped idempotency fixtures"], root);
@@ -431,7 +431,19 @@ test("safe append idempotency is scoped to body anchors and journal sections", (
   let flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
   assert.equal(flush.results[0].ok, true);
   let page = s.read_page("Scoped Body", true);
-  assert.match(page.raw, /- Target\n\t- existing\n\t- duplicate line/);
+  assert.match(page.raw, /- Target\n\t- existing\n\t- callback\n\t- duplicate line/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-prefix-is-not-applied",
+    tool: "update_body_section",
+    arguments: { name: "Scoped Body", anchor: "Target", mode: "append_to_section", new_content: "\t- call" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  page = s.read_page("Scoped Body", true);
+  assert.match(page.raw, /- Target\n\t- existing\n\t- callback\n\t- duplicate line\n\t- call/);
 
   submit = s.callTool("submit_write_intent", {
     idempotency_key: "test:journal-marker-in-other-section",
