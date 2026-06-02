@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { isCaseInsensitiveDir, makeGraph, repo, run, server, status, writePage } from "./helpers/logseq-fixtures.js";
+import { GitTxn } from "../dist/graph/git-guard.js";
+import { LogseqServer } from "../dist/logseq.js";
 
 const mutatingToolCalls = [
   ["update_property", { name: "Alice", key: "status", value: "blocked" }],
@@ -18,6 +21,30 @@ const mutatingToolCalls = [
   ["update_body_section", { name: "Alice", anchor: "hello", new_content: "- blocked" }],
   ["regenerate_index", {}],
 ];
+
+function installFakeDate(iso) {
+  const RealDate = globalThis.Date;
+  const fixedMs = RealDate.parse(iso);
+  class FakeDate extends RealDate {
+    constructor(...args) {
+      super(...(args.length ? args : [fixedMs]));
+    }
+    static now() {
+      return fixedMs;
+    }
+  }
+  FakeDate.parse = RealDate.parse;
+  FakeDate.UTC = RealDate.UTC;
+  globalThis.Date = FakeDate;
+  return () => {
+    globalThis.Date = RealDate;
+  };
+}
+
+function hashFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
 
 function assertStrictObjectSchemas(schema, label) {
   if (!schema || typeof schema !== "object") return;
@@ -78,6 +105,50 @@ test("tool definitions are strict and cover every callable tool", () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("default write mode exposes safe-write tools and hides raw mutating tools", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({
+    root,
+    env: {
+      ...process.env,
+      LOGSEQ_ROOT: root,
+      LOGSEQ_GIT_GUARD: "strict",
+      LOGSEQ_VALIDATE_SCHEMA: "block",
+      LOGSEQ_MAX_RESPONSE_BYTES: "500000",
+      LOGSEQ_WATCH: "0",
+    },
+  });
+  const toolNames = Object.keys(s.tools()).sort();
+  assert.ok(toolNames.includes("submit_write_intent"));
+  assert.ok(toolNames.includes("flush_write_intents"));
+  assert.ok(toolNames.includes("graph_status"));
+  for (const [name] of mutatingToolCalls) assert.equal(toolNames.includes(name), false, name);
+  assert.deepEqual(s.toolDefinitions().map((d) => d.name).sort(), toolNames);
+  assert.match(s.callTool("update_property", { name: "Alice", key: "status", value: "blocked" }).error, /unknown tool/);
+  const statusResult = s.graph_status();
+  assert.equal(statusResult.write_mode, "intent");
+  assert.ok(statusResult.write_intents);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("admin_raw write mode exposes raw mutating tools", () => {
+  const root = makeGraph();
+  const toolNames = Object.keys(server(root).tools()).sort();
+  for (const [name] of mutatingToolCalls) assert.equal(toolNames.includes(name), true, name);
+  assert.deepEqual(server(root).toolDefinitions().map((d) => d.name).sort(), toolNames);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("invalid write mode fails closed to readonly tools", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WRITE_MODE: "readony", LOGSEQ_WATCH: "0" } });
+  const toolNames = Object.keys(s.tools());
+  assert.equal(s.graph_status().write_mode, "readonly");
+  assert.equal(toolNames.includes("submit_write_intent"), false);
+  assert.equal(toolNames.includes("create_stub"), false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("public release metadata avoids local-only leakage", () => {
   const files = [
     "README.md",
@@ -124,12 +195,11 @@ test("public package and tool surface avoid local-only leakage", () => {
 
 test("readonly mode gates every mutating tool before graph changes", () => {
   const root = makeGraph();
-  const s = server(root, { LOGSEQ_READONLY: "1" });
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_READONLY: "1", LOGSEQ_WRITE_MODE: "admin_raw", LOGSEQ_WATCH: "0" } });
   for (const [name, args] of mutatingToolCalls) {
     const res = s.callTool(name, args);
     assert.equal(res.ok, false, name);
-    assert.equal(res.readonly, true, name);
-    assert.match(res.error, /LOGSEQ_READONLY/, name);
+    assert.match(res.error, /unknown tool/, name);
   }
   assert.equal(status(root), "");
   fs.rmSync(root, { recursive: true, force: true });
@@ -207,6 +277,1099 @@ test("git guard blocks dirty graph before write and commits clean writes", () =>
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("safe write intents are idempotent and flush through git guard", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({
+    root,
+    env: {
+      ...process.env,
+      LOGSEQ_ROOT: root,
+      LOGSEQ_GIT_GUARD: "strict",
+      LOGSEQ_VALIDATE_SCHEMA: "block",
+      LOGSEQ_MAX_RESPONSE_BYTES: "500000",
+      LOGSEQ_WATCH: "0",
+    },
+  });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:update-alice-status",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "warm" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const intentId = submit.intent.intent_id;
+  assert.equal(submit.intent.state, "pending");
+  assert.equal(submit.intent.idempotency_key, "test:update-alice-status");
+
+  const duplicate = s.callTool("submit_write_intent", {
+    idempotency_key: "test:update-alice-status",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "warm" },
+    caller: "test",
+  });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.intent.intent_id, intentId);
+  assert.equal(duplicate.intent.idempotency_key, "test:update-alice-status");
+
+  const conflict = s.callTool("submit_write_intent", {
+    idempotency_key: "test:update-alice-status",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "cold" },
+    caller: "test",
+  });
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.error_class, "idempotency_conflict");
+
+  const flush = s.callTool("flush_write_intents", { intent_ids: [intentId] });
+  assert.equal(flush.ok, true);
+  assert.equal(flush.success_count, 1);
+  assert.equal(flush.results[0].ok, true);
+  assert.equal(server(root).read_page("Alice").properties.status, "warm");
+  assert.equal(status(root), "");
+  assert.match(run("git", ["log", "-1", "--format=%B"], root), /op_id:/);
+  assert.match(run("git", ["log", "-1", "--format=%B"], root), /idempotency_key:/);
+  const completedIntent = s.callTool("get_write_intent", { intent_id: intentId }).intent;
+  assert.equal(completedIntent.state, "completed");
+  assert.ok(completedIntent.git_commit);
+  assert.ok(completedIntent.completed_at);
+  const committedRows = s.writeLedger.db.prepare("SELECT COUNT(*) AS count FROM operations WHERE state = 'committed'").get();
+  assert.equal(committedRows.count, 0);
+
+  const secondFlush = s.callTool("flush_write_intents", { intent_ids: [intentId] });
+  assert.equal(secondFlush.ok, true);
+  assert.equal(secondFlush.results[0].duplicate, true);
+  assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe append intent retry does not duplicate content", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-append",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-01", content: "safe retry [[Alice]]" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const intentId = submit.intent.intent_id;
+  let flush = s.callTool("flush_write_intents", { intent_ids: [intentId] });
+  assert.equal(flush.results[0].ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [intentId] });
+  assert.equal(flush.results[0].ok, true);
+  const journal = fs.readFileSync(path.join(root, "journals", "2026_06_01.md"), "utf8");
+  assert.equal((journal.match(/safe retry \[\[Alice\]\]/g) || []).length, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe append journal intent rejects symlinked journal before recording ledger row", () => {
+  const root = makeGraph();
+  fs.writeFileSync(path.join(root, "journals", "2026_06_04_target.md"), "- existing\n", "utf8");
+  fs.symlinkSync(path.join(root, "journals", "2026_06_04_target.md"), path.join(root, "journals", "2026_06_04.md"));
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-symlink",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-04", content: "should not record" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, false);
+  assert.match(submit.error, /symlink/);
+  const list = s.callTool("list_write_intents", {});
+  assert.equal(list.ok, true);
+  assert.equal(list.intents.length, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe contact log idempotency is scoped to the contact log section", () => {
+  const root = makeGraph();
+  writePage(root, "Alice", "type:: person\nstatus:: active\nlast-contacted:: 2026-05-01\n\n- Prior note mentions 2026-05-20 - email - caught up outside the log\n");
+  run("git", ["add", "pages/Alice.md"], root);
+  run("git", ["commit", "-q", "-m", "mention contact marker outside log"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:contact-log-section-idempotency",
+    tool: "append_contact_log",
+    arguments: { name: "Alice", medium: "email", summary: "caught up", date: "2026-05-20" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  const page = s.read_page("Alice");
+  assert.equal(page.properties["last-contacted"], "2026-05-20");
+  assert.match(page.body, /- \*\*Contact log\*\* \(newest first\)\n\t- 2026-05-20 - email - caught up/);
+
+  const prefixSubmit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:contact-log-prefix-is-not-applied",
+    tool: "append_contact_log",
+    arguments: { name: "Alice", medium: "email", summary: "caught", date: "2026-05-20" },
+    caller: "test",
+  });
+  assert.equal(prefixSubmit.ok, true);
+  const prefixFlush = s.callTool("flush_write_intents", { intent_ids: [prefixSubmit.intent.intent_id] });
+  assert.equal(prefixFlush.results[0].ok, true);
+  const updated = s.read_page("Alice");
+  assert.match(updated.body, /- \*\*Contact log\*\* \(newest first\)\n\t- 2026-05-20 - email - caught\n\t- 2026-05-20 - email - caught up/);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe append idempotency is scoped to body anchors and journal sections", () => {
+  const root = makeGraph();
+  writePage(root, "Scoped Body", "type:: note\n\n- Other\n\t- duplicate line\n- Target\n\t- existing\n\t- callback\n");
+  fs.writeFileSync(path.join(root, "journals", "2026_06_03.md"), "- ## Other\n\t- duplicate bullet\n- ## duplicate top bullet\n- ## Target\n\t- existing\n\t- callback\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add scoped idempotency fixtures"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+
+  let submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-marker-in-other-block",
+    tool: "update_body_section",
+    arguments: { name: "Scoped Body", anchor: "Target", mode: "append_to_section", new_content: "\t- duplicate line" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  let flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  let page = s.read_page("Scoped Body", true);
+  assert.match(page.raw, /- Target\n\t- existing\n\t- callback\n\t- duplicate line/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-prefix-is-not-applied",
+    tool: "update_body_section",
+    arguments: { name: "Scoped Body", anchor: "Target", mode: "append_to_section", new_content: "\t- call" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  page = s.read_page("Scoped Body", true);
+  assert.match(page.raw, /- Target\n\t- existing\n\t- callback\n\t- duplicate line\n\t- call/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-marker-in-other-section",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-03", section: "Target", content: "duplicate bullet" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  let journal = s.read_journal("2026-06-03");
+  assert.match(journal.raw, /- ## Target\n\t- duplicate bullet\n\t- existing/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-marker-in-heading",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-03", content: "duplicate top bullet" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  journal = s.read_journal("2026-06-03");
+  assert.match(journal.raw, /\n- duplicate top bullet\n?$/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-section-prefix-is-not-applied",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-03", section: "Target", content: "call" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  journal = s.read_journal("2026-06-03");
+  assert.match(journal.raw, /- ## Target\n\t- call\n\t- duplicate bullet\n\t- existing\n\t- callback/);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intents classify dirty graph as retryable without mutating", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:dirty-graph",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "warm" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: active\nlast-contacted:: 2026-05-01\n\n- dirty\n", "utf8");
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.ok, true);
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "manual_review");
+  assert.match(flush.results[0].error, /target changed|clean Logseq graph/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intents require explicit flush ids and keep ledger out of git", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const emptyFlush = s.callTool("flush_write_intents", {});
+  assert.equal(emptyFlush.ok, false);
+  assert.match(emptyFlush.error, /intent_ids/);
+
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:ledger-outside",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "queued" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const statusResult = s.graph_status();
+  assert.equal(statusResult.ok, true);
+  assert.equal(path.resolve(statusResult.write_intents.ledger_file).startsWith(path.resolve(root)), false);
+  assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe already-applied flush claims intent before completing", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:already-applied-claims-first",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-01", content: "externally applied [[Alice]]" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const journalPath = path.join(root, "journals", "2026_06_01.md");
+  fs.writeFileSync(journalPath, "- externally applied [[Alice]]\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "external journal append"], root);
+
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  assert.equal(flush.results[0].reconciled, true);
+  const intent = s.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.equal(intent.attempt_count, 1);
+  const journal = fs.readFileSync(journalPath, "utf8");
+  assert.equal((journal.match(/externally applied/g) ?? []).length, 1);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intent claims are atomic across repeated flush attempts", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:atomic-claim",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-01", content: "atomic claim [[Alice]]" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const record = s.writeLedger.get(submit.intent.intent_id);
+  const first = s.writeLedger.claimForFlush(record, 60_000);
+  assert.equal(first.claimed, true);
+  const second = s.writeLedger.claimForFlush(record, 60_000);
+  assert.equal(second.claimed, false);
+  assert.equal(second.record.state, "applying");
+  assert.equal(second.record.attempt_count, 1);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intents reject schema and dangling links before ledger mutation", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_VALIDATE_SCHEMA: "block", LOGSEQ_WATCH: "0" } });
+  let res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:bad-schema",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "unknown-key", value: "x" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /not in schema/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:dangling",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "[[Ghost Town]]" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /dangling wikilink/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:create-stub-bad-property",
+    tool: "create_stub",
+    arguments: { name: "New Stub", properties: { "unknown-key": "x" } },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /not in schema/);
+
+  fs.mkdirSync(path.join(root, "pages", "Directory Stub.md"));
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:create-stub-existing-path",
+    tool: "create_stub",
+    arguments: { name: "Directory Stub" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /File exists/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:create-stub-dangling",
+    tool: "create_stub",
+    arguments: { name: "Linked Stub", notes: ["see [[Ghost Town]]"] },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /dangling wikilink/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-invalid-mode",
+    tool: "update_body_section",
+    arguments: { name: "Alice", anchor: "hello", mode: "bad_mode", new_content: "- replacement" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /mode must be one of/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-missing-content",
+    tool: "update_body_section",
+    arguments: { name: "Alice", anchor: "hello", mode: "replace_block" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /new_content is required/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:body-dangling-link",
+    tool: "update_body_section",
+    arguments: { name: "Alice", anchor: "hello", new_content: "- [[Ghost Town]]" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /dangling wikilink/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:batch-duplicate-target",
+    tool: "batch_update_property",
+    arguments: {
+      updates: [
+        { name: "Alice", key: "status", value: "warm" },
+        { name: "Alice", key: "status", value: "hot" },
+      ],
+    },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /duplicate batch update target/);
+
+  res = s.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-schema",
+    tool: "delete_page",
+    arguments: { name: "schema___properties" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /schema/);
+
+  writePage(root, "Bob", "type:: person\n\n- knows [[Alice]]\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add backlink page"], root);
+  const s2 = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_VALIDATE_SCHEMA: "block", LOGSEQ_WATCH: "0" } });
+  res = s2.callTool("submit_write_intent", {
+    idempotency_key: "test:rename-existing-destination",
+    tool: "rename_page",
+    arguments: { old_name: "Alice", new_name: "Bob" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /Destination exists/);
+
+  res = s2.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-linked-page",
+    tool: "delete_page",
+    arguments: { name: "Alice" },
+    caller: "test",
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /backlinks/);
+
+  const list = s2.callTool("list_write_intents", {});
+  assert.equal(list.count, 0);
+  assert.equal(status(root), "");
+  s.close();
+  s2.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe delete_page intent flushes through planned suffixed archive path", () => {
+  const root = makeGraph();
+  const now = new Date();
+  const archiveDir = path.join(root, "archive", String(now.getFullYear()).padStart(4, "0"), String(now.getMonth() + 1).padStart(2, "0"));
+  fs.mkdirSync(archiveDir, { recursive: true });
+  fs.writeFileSync(path.join(archiveDir, "Bad Date.md"), "existing archive collision\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add archive collision"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-page-suffixed-archive",
+    tool: "delete_page",
+    arguments: { name: "Bad Date" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const archiveEffect = s.writeLedger.effects(submit.intent.intent_id).find((effect) => effect.effect_type === "delete_page_archive");
+  assert.ok(archiveEffect.path.startsWith("archive/"));
+  assert.notEqual(archiveEffect.path, path.join("archive", String(now.getFullYear()).padStart(4, "0"), String(now.getMonth() + 1).padStart(2, "0"), "Bad Date.md"));
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  assert.equal(flush.results[0].result.archived_path, archiveEffect.path);
+  assert.equal(fs.existsSync(path.join(root, archiveEffect.path)), true);
+  assert.equal(status(root), "");
+  const duplicate = s.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-page-suffixed-archive",
+    tool: "delete_page",
+    arguments: { name: "Bad Date" },
+    caller: "test",
+  });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.intent.intent_id, submit.intent.intent_id);
+  assert.equal(duplicate.intent.state, "completed");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write audit uses the submitted ledger audit path across midnight", () => {
+  const root = makeGraph();
+  let restoreDate = installFakeDate("2026-06-01T23:59:00.000Z");
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:audit-path-frozen",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "after-midnight" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  restoreDate();
+  restoreDate = installFakeDate("2026-06-02T00:01:00.000Z");
+  try {
+    const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+    assert.equal(flush.results[0].ok, true);
+  } finally {
+    restoreDate();
+  }
+  assert.equal(fs.existsSync(path.join(root, "journals", "2026_06_01.md")), true);
+  assert.equal(fs.existsSync(path.join(root, "journals", "2026_06_02.md")), false);
+  assert.equal(status(root), "");
+
+  restoreDate = installFakeDate("2026-06-01T23:59:00.000Z");
+  const journalSubmit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:audit-path-frozen-journal-target",
+    tool: "append_journal_bullet",
+    arguments: { content: "journal audit path frozen" },
+    caller: "test",
+  });
+  assert.equal(journalSubmit.ok, true);
+  const effects = s.writeLedger.effects(journalSubmit.intent.intent_id);
+  assert.equal(effects.some((effect) => effect.effect_type === "audit_journal" && effect.path === "journals/2026_06_01.md"), true);
+  restoreDate();
+  restoreDate = installFakeDate("2026-06-02T00:01:00.000Z");
+  try {
+    const journalFlush = s.callTool("flush_write_intents", { intent_ids: [journalSubmit.intent.intent_id] });
+    assert.equal(journalFlush.results[0].ok, true);
+  } finally {
+    restoreDate();
+  }
+  assert.match(fs.readFileSync(path.join(root, "journals", "2026_06_01.md"), "utf8"), /journal audit path frozen/);
+  assert.equal(fs.existsSync(path.join(root, "journals", "2026_06_02.md")), false);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe create_stub intent does not complete from a partial external stub", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_VALIDATE_SCHEMA: "block", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:create-stub-partial-external",
+    tool: "create_stub",
+    arguments: { name: "Partial Stub", properties: { status: "active" }, notes: ["requested note"], source: "safe-intent-test" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  writePage(root, "Partial Stub", "type:: person\nconfidence:: low\n\n- different content\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "external partial stub"], root);
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "manual_review");
+  assert.match(JSON.stringify(flush.results[0]), /target changed/);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intents move stale base conflicts to manual review and reject invalid anchors", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const before = run("git", ["rev-parse", "HEAD"], root);
+  const stale = s.callTool("submit_write_intent", {
+    idempotency_key: "test:stale-head",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "later" },
+    expected_base_head: before,
+    caller: "test",
+  });
+  assert.equal(stale.ok, true);
+  run("git", ["commit", "--allow-empty", "-q", "-m", "advance head"], root);
+  let flush = s.callTool("flush_write_intents", { intent_ids: [stale.intent.intent_id] });
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "manual_review");
+  assert.match(flush.results[0].error, /expected_base_head/);
+
+  const missingAnchor = s.callTool("submit_write_intent", {
+    idempotency_key: "test:missing-anchor",
+    tool: "update_body_section",
+    arguments: { name: "Alice", anchor: "not in file", new_content: "- replacement" },
+    caller: "test",
+  });
+  assert.equal(missingAnchor.ok, false);
+  assert.match(missingAnchor.error, /anchor/);
+
+  const missingDeleteAnchor = s.callTool("submit_write_intent", {
+    idempotency_key: "test:missing-delete-anchor",
+    tool: "update_body_section",
+    arguments: { name: "Alice", anchor: "not in file", mode: "delete_block" },
+    caller: "test",
+  });
+  assert.equal(missingDeleteAnchor.ok, false);
+  assert.match(missingDeleteAnchor.error, /anchor/);
+
+  writePage(root, "Ambiguous Body", "type:: note\n\n- target\n- target\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add ambiguous body"], root);
+  const ambiguousAnchor = s.callTool("submit_write_intent", {
+    idempotency_key: "test:ambiguous-anchor",
+    tool: "update_body_section",
+    arguments: { name: "Ambiguous Body", anchor: "target", new_content: "- replacement" },
+    caller: "test",
+  });
+  assert.equal(ambiguousAnchor.ok, false);
+  assert.match(ambiguousAnchor.error, /anchor/);
+
+  const staleDelete = s.callTool("submit_write_intent", {
+    idempotency_key: "test:stale-delete-property",
+    tool: "delete_property",
+    arguments: { name: "Alice", key: "status" },
+    caller: "test",
+  });
+  assert.equal(staleDelete.ok, true);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: archived\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "change status after intent"], root);
+  flush = s.callTool("flush_write_intents", { intent_ids: [staleDelete.intent.intent_id] });
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "manual_review");
+  assert.match(JSON.stringify(flush.results[0]), /target changed/);
+  assert.equal(server(root).read_page("Alice").properties.status, "archived");
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe update_body_section delete intent deletes instead of matching empty marker", () => {
+  const root = makeGraph();
+  writePage(root, "Body Delete", "type:: note\n\n- keep\n- delete me\n\t- child\n- after\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add body delete page"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:delete-body-block",
+    tool: "update_body_section",
+    arguments: { name: "Body Delete", anchor: "delete me", mode: "delete_block" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  const page = s.read_page("Body Delete");
+  assert.doesNotMatch(page.body, /delete me/);
+  assert.doesNotMatch(page.body, /child/);
+  assert.match(page.body, /after/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe update_body_section replace rejects missing anchor even when content exists elsewhere", () => {
+  const root = makeGraph();
+  writePage(root, "Body Replace", "type:: note\n\n- existing replacement text\n- keep original\n");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "add body replace page"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:replace-body-missing-anchor",
+    tool: "update_body_section",
+    arguments: { name: "Body Replace", anchor: "missing anchor", mode: "replace_block", new_content: "- existing replacement text" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, false);
+  assert.match(submit.error, /anchor/);
+  const page = s.read_page("Body Replace");
+  assert.match(page.body, /keep original/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe write intents classify blast radius failures and preserve clean graph", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_GIT_MAX_CHANGED_FILES: "1", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:blast-radius",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "too-wide" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "manual_review");
+  assert.match(JSON.stringify(flush.results[0]), /blast-radius|files changed/);
+  assert.equal(server(root).read_page("Alice").properties.status, "active");
+  assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("safe batch partial commits complete the intent instead of retrying", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_LOCK_TIMEOUT_MS: "25", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:batch-partial-commit",
+    tool: "batch_update_property",
+    arguments: {
+      updates: [
+        { name: "Alice", key: "status", value: "warm" },
+        { name: "Bad Date", key: "status", value: "warm" },
+      ],
+    },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const locked = path.join(root, "pages", "Bad Date.md.lock");
+  fs.writeFileSync(locked, "held", "utf8");
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, false);
+  assert.equal(flush.results[0].state, "completed");
+  assert.equal(flush.results[0].committed, true);
+  assert.ok(flush.results[0].intent.git_commit);
+  assert.equal(s.read_page("Alice").properties.status, "warm");
+  assert.equal(s.read_page("Bad Date").properties.status, "active");
+  assert.equal(s.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent.state, "completed");
+  fs.rmSync(locked, { force: true });
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("graph status reports stale metadata lockfiles without breaking them", () => {
+  const root = makeGraph();
+  const lockPath = path.join(root, "pages", "Alice.md.lock");
+  const metadata = {
+    op_id: "stale-op",
+    pid: 99999999,
+    process_start_time: "unknown",
+    host: "test-host",
+    target: "pages/Alice.md",
+    created_at: "2026-06-01T00:00:00.000Z",
+    expires_at: "2026-06-01T00:00:01.000Z",
+  };
+  fs.writeFileSync(lockPath, JSON.stringify(metadata), "utf8");
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const statusResult = s.graph_status();
+  assert.equal(statusResult.ok, true);
+  assert.equal(statusResult.locks.file_lock_count_sampled, 1);
+  assert.equal(statusResult.locks.file_locks[0].stale, true);
+  assert.equal(statusResult.locks.file_locks[0].metadata.op_id, "stale-op");
+  assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation returns applying-before-write intents to pending", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-before-write",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  assert.equal(started.state, "applying");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "pending");
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation ignores audit-only drift before target writes", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-before-write-audit-drift",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  assert.equal(started.state, "applying");
+  const auditEffect = s.writeLedger.effects(submit.intent.intent_id).find((effect) => effect.effect_type === "audit_journal");
+  assert.ok(auditEffect);
+  fs.mkdirSync(path.dirname(path.join(root, auditEffect.path)), { recursive: true });
+  fs.writeFileSync(path.join(root, auditEffect.path), "- unrelated committed audit entry\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "unrelated audit write"], root);
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "pending");
+  assert.equal(recovered.read_page("Alice").properties.status, "active");
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("write intent polling recovers leases that expire after startup", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-after-startup",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const started = s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), 60_000);
+  assert.equal(started.state, "applying");
+  s.close();
+
+  const restarted = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  assert.equal(restarted.writeLedger.get(submit.intent.intent_id).state, "applying");
+  restarted.writeLedger.db.prepare("UPDATE operations SET lease_expires_at = ? WHERE op_id = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), submit.intent.intent_id);
+  const intent = restarted.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "pending");
+  assert.equal(status(root), "");
+  restarted.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation commits expected file effects after crash before commit", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-file-effect",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: recovered\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  const effectsAfter = s.writeLedger.effects(submit.intent.intent_id).map((effect) => ({
+    ...effect,
+    after_hash: hashFile(path.join(root, effect.path)),
+  }));
+  const applying = s.writeLedger.get(submit.intent.intent_id);
+  s.writeLedger.markAppliedUncommitted(applying, effectsAfter);
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.ok(intent.git_commit);
+  assert.equal(recovered.read_page("Alice").properties.status, "recovered");
+  assert.equal(status(root), "");
+  const body = run("git", ["log", "-1", "--format=%B"], root);
+  assert.match(body, /reconciled: true/);
+  assert.match(body, /op_id:/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation refuses unproven same-file dirty recovery", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-file-effect-with-extra-drift",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "recovered" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: recovered\nlast-contacted:: 2026-05-01\npriority:: high\n\n- hello\n- unrelated dirty edit\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "manual_review");
+  assert.equal(recovered.read_page("Alice").properties.status, "recovered");
+  assert.match(status(root), /pages\/Alice\.md/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation commits recovered delete_property effects", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-delete-property",
+    tool: "delete_property",
+    arguments: { name: "Alice", key: "status" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  const effectsAfter = s.writeLedger.effects(submit.intent.intent_id).map((effect) => ({
+    ...effect,
+    after_hash: hashFile(path.join(root, effect.path)),
+  }));
+  s.writeLedger.markAppliedUncommitted(s.writeLedger.get(submit.intent.intent_id), effectsAfter);
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.ok(intent.git_commit);
+  assert.equal(recovered.read_page("Alice").properties.status, undefined);
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation rejects unrelated dirty delete_property marker matches", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-delete-property-marker-mismatch",
+    tool: "delete_property",
+    arguments: { name: "Alice", key: "status" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: archived\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "manual_review");
+  assert.equal(recovered.read_page("Alice").properties.status, "archived");
+  assert.match(status(root), /pages\/Alice\.md/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation commits recovered source-delete effects", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  let submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-delete-page",
+    tool: "delete_page",
+    arguments: { name: "Bad Date" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  let effects = s.writeLedger.effects(submit.intent.intent_id);
+  let source = path.join(root, effects.find((effect) => effect.effect_type === "delete_page").path);
+  let archive = path.join(root, effects.find((effect) => effect.effect_type === "delete_page_archive").path);
+  fs.mkdirSync(path.dirname(archive), { recursive: true });
+  fs.renameSync(source, archive);
+  s.close();
+
+  let recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  let intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.ok(intent.git_commit);
+  assert.equal(fs.existsSync(source), false);
+  assert.equal(fs.existsSync(archive), true);
+  assert.equal(status(root), "");
+  recovered.close();
+
+  const renameServer = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  submit = renameServer.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-rename-no-redirect",
+    tool: "rename_page",
+    arguments: { old_name: "Alice", new_name: "Alice Gone", leave_redirect: false },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  renameServer.writeLedger.start(renameServer.writeLedger.get(submit.intent.intent_id), -1000);
+  effects = renameServer.writeLedger.effects(submit.intent.intent_id);
+  source = path.join(root, effects.find((effect) => effect.effect_type === "rename_page_source").path);
+  const destination = path.join(root, effects.find((effect) => effect.effect_type === "rename_page_destination").path);
+  fs.copyFileSync(source, destination);
+  fs.unlinkSync(source);
+  renameServer.close();
+
+  recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.ok(intent.git_commit);
+  assert.equal(fs.existsSync(source), false);
+  assert.equal(fs.existsSync(destination), true);
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation commits recovered rename redirect effects", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-rename-redirect",
+    tool: "rename_page",
+    arguments: { old_name: "Alice", new_name: "Alice Redirected" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  const effects = s.writeLedger.effects(submit.intent.intent_id);
+  const source = path.join(root, effects.find((effect) => effect.effect_type === "rename_page_source").path);
+  const destination = path.join(root, effects.find((effect) => effect.effect_type === "rename_page_destination").path);
+  const audit = path.join(root, effects.find((effect) => effect.effect_type === "audit_journal").path);
+  fs.copyFileSync(source, destination);
+  fs.writeFileSync(source, "type:: redirect\nredirects-to:: [[Alice Redirected]]\n\n- Redirected to [[Alice Redirected]].\n", "utf8");
+  fs.writeFileSync(audit, "- rename_page :: \"Alice\" -> \"Alice Redirected\" (redirect=true)\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.ok(intent.git_commit);
+  assert.match(fs.readFileSync(source, "utf8"), /type:: redirect/);
+  assert.match(fs.readFileSync(destination, "utf8"), /status:: active/);
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation sends unexpected same-path effects to manual review", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-same-path-mismatch",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "intended" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  s.writeLedger.start(s.writeLedger.get(submit.intent.intent_id), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: wrong-value\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "manual_review");
+  assert.equal(recovered.read_page("Alice").properties.status, "wrong-value");
+  assert.match(status(root), /pages\/Alice\.md/);
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation completes from existing intent commit metadata", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-existing-commit",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "committed" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const opId = submit.intent.intent_id;
+  const record = s.writeLedger.start(s.writeLedger.get(opId), -1000);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: committed\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", [
+    "commit",
+    "-q",
+    "-m",
+    "manual recovered commit",
+    "-m",
+    `op_id: ${record.op_id}`,
+    "-m",
+    `idempotency_key: ${record.idempotency_key}`,
+    "-m",
+    `request_hash: ${record.request_hash}`,
+  ], root);
+  const commit = run("git", ["rev-parse", "HEAD"], root);
+  s.close();
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: opId }).intent;
+  assert.equal(intent.state, "completed");
+  assert.equal(intent.git_commit, commit);
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("startup reconciliation ignores intent commits unreachable from current HEAD", () => {
+  const root = makeGraph();
+  const branch = run("git", ["branch", "--show-current"], root);
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:recover-other-branch-commit",
+    tool: "update_property",
+    arguments: { name: "Alice", key: "status", value: "branch-only" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const opId = submit.intent.intent_id;
+  const record = s.writeLedger.start(s.writeLedger.get(opId), -1000);
+  s.close();
+
+  run("git", ["switch", "-q", "-c", "side-intent-commit"], root);
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: branch-only\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", [
+    "commit",
+    "-q",
+    "-m",
+    "side branch intent commit",
+    "-m",
+    `op_id: ${record.op_id}`,
+    "-m",
+    `idempotency_key: ${record.idempotency_key}`,
+    "-m",
+    `request_hash: ${record.request_hash}`,
+  ], root);
+  const sideCommit = run("git", ["rev-parse", "HEAD"], root);
+  run("git", ["switch", "-q", branch], root);
+
+  const recovered = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" } });
+  const intent = recovered.callTool("get_write_intent", { intent_id: opId }).intent;
+  assert.equal(intent.state, "pending");
+  assert.equal(intent.git_commit, null);
+  assert.notEqual(run("git", ["rev-parse", "HEAD"], root), sideCommit);
+  assert.equal(recovered.read_page("Alice").properties.status, "active");
+  assert.equal(status(root), "");
+  recovered.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("strict git guard refuses oversized writes before checkpoint commit", () => {
   const root = makeGraph();
   const before = run("git", ["rev-parse", "HEAD"], root);
@@ -229,6 +1392,36 @@ test("warn git guard reports oversized writes after checkpoint", () => {
   assert.match(res.git_guard.violation, /blast-radius|files changed/);
   assert.ok(res.git_guard.commit);
   assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("strict git guard rolls back unexpected intent paths from failed transaction", () => {
+  const root = makeGraph();
+  const s = server(root, { LOGSEQ_GIT_GUARD: "strict" });
+  const txn = new GitTxn(s, "test_guard", 10, 10, () => "txn-test", {}, new Set(["pages/Alice.md"]));
+  txn.begin();
+  fs.writeFileSync(path.join(root, "pages", "Alice.md"), "type:: person\nstatus:: changed\nlast-contacted:: 2026-05-01\n\n- hello\n", "utf8");
+  fs.writeFileSync(path.join(root, "pages", "Unexpected.md"), "type:: note\n\n- outside intent\n", "utf8");
+  assert.throws(() => txn.finish(), /unexpected dirty path/);
+  assert.match(fs.readFileSync(path.join(root, "pages", "Alice.md"), "utf8"), /status:: active/);
+  assert.equal(fs.existsSync(path.join(root, "pages", "Unexpected.md")), false);
+  assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("warn git guard does not stage whole repo when no expected paths changed", () => {
+  const root = makeGraph();
+  const before = run("git", ["rev-parse", "HEAD"], root);
+  const s = server(root, { LOGSEQ_GIT_GUARD: "warn" });
+  const txn = new GitTxn(s, "test_guard", 10, 10, () => "txn-test", {}, new Set(["pages/Alice.md"]));
+  txn.begin();
+  fs.writeFileSync(path.join(root, "pages", "Unrelated.md"), "type:: note\n\n- outside intent\n", "utf8");
+  txn.finish();
+  assert.equal(txn.commit, null);
+  assert.match(txn.violation, /unexpected dirty path/);
+  assert.equal(run("git", ["rev-parse", "HEAD"], root), before);
+  assert.match(status(root), /\?\? pages\/Unrelated\.md/);
+  s.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -571,20 +1764,33 @@ console.log(JSON.stringify({ engine: mod.regexEngineName(), match: compiled.sear
   fs.rmSync(moduleRoot, { recursive: true, force: true });
 });
 
-test("stdio MCP initialize, tools/list, readonly write call", () => {
+test("stdio MCP initialize, tools/list, safe write intent call", () => {
   const root = makeGraph();
   const pkg = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8"));
   const payload = [
-    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0.1" } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0.1" } } }),
     JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
-    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "create_stub", arguments: { name: "Blocked Stub" } } }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "submit_write_intent",
+        arguments: {
+          idempotency_key: "stdio:update-alice",
+          tool: "update_property",
+          arguments: { name: "Alice", key: "status", value: "warm" },
+          caller: "stdio-test",
+        },
+      },
+    }),
     "",
   ].join("\n");
   const res = spawnSync(process.execPath, [path.join(repo, pkg.bin["logseq-graph-mcp"]), "--root", root], {
     input: payload,
     encoding: "utf8",
-    env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_READONLY: "1", LOGSEQ_GIT_GUARD: "strict" },
+    env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" },
     timeout: 20000,
   });
   assert.equal(res.status, 0, res.stderr);
@@ -594,9 +1800,37 @@ test("stdio MCP initialize, tools/list, readonly write call", () => {
     version: pkg.version,
   });
   assert.match(JSON.stringify(responses), /graph_status/);
-  assert.match(JSON.stringify(responses), /create_stub/);
-  assert.match(res.stderr, /readonly = True/);
-  assert.match(JSON.stringify(responses), /LOGSEQ_READONLY/);
+  assert.match(JSON.stringify(responses), /submit_write_intent/);
+  const toolNames = responses.find((entry) => entry.id === 2).result.tools.map((tool) => tool.name);
+  assert.equal(toolNames.includes("submit_write_intent"), true);
+  assert.equal(toolNames.includes("create_stub"), false);
+  assert.match(res.stderr, /write mode = intent/);
+  assert.match(JSON.stringify(responses), /structuredContent/);
+  assert.match(JSON.stringify(responses), /stdio:update-alice/);
   assert.equal(status(root), "");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("stdio MCP legacy protocol omits structured content", () => {
+  const root = makeGraph();
+  const pkg = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8"));
+  const payload = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "legacy-test", version: "0.1" } } }),
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "graph_status", arguments: {} } }),
+    "",
+  ].join("\n");
+  const res = spawnSync(process.execPath, [path.join(repo, pkg.bin["logseq-graph-mcp"]), "--root", root, "--readonly"], {
+    input: payload,
+    encoding: "utf8",
+    env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_WATCH: "0" },
+    timeout: 20000,
+  });
+  assert.equal(res.status, 0, res.stderr);
+  const responses = res.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(responses.find((entry) => entry.id === 1).result.protocolVersion, "2024-11-05");
+  const call = responses.find((entry) => entry.id === 2).result;
+  assert.equal("structuredContent" in call, false);
+  assert.equal(call.isError, false);
   fs.rmSync(root, { recursive: true, force: true });
 });

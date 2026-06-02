@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { StatusEntry } from "../types.js";
-import { LockHandle, sleepMs } from "./write-guards.js";
+import { LockHandle, lockMetadata, sleepMs } from "./write-guards.js";
 
 export class GitGuardError extends Error {
   payload: Record<string, unknown>;
@@ -37,6 +37,8 @@ export class GitTxn {
     private readonly maxChangedFiles: number,
     private readonly maxDeletedFiles: number,
     makeTxnId: () => string,
+    private readonly metadata: Record<string, string> = {},
+    private readonly expectedPaths: Set<string> | null = null,
   ) {
     this.txnId = makeTxnId();
   }
@@ -57,6 +59,7 @@ export class GitTxn {
     while (fd === null) {
       try {
         fd = fs.openSync(lockPath, "wx", 0o644);
+        fs.writeFileSync(fd, `${JSON.stringify(lockMetadata(this.server.root, 60000, this.metadata.op_id ?? this.txnId), null, 2)}\n`, "utf8");
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() > deadline) throw err;
         sleepMs(50);
@@ -93,11 +96,19 @@ export class GitTxn {
       if (!this.server.gitInsideWorktree()) return;
       this.changed = this.server.gitStatusEntries();
       if (!this.changed.length) return;
-      const deleted = this.changed.filter((e) => e.status.includes("D"));
+      const changedPathSet = new Set(this.changed.flatMap((e) => [e.path, e.old_path]).filter(Boolean));
+      const unexpected = this.expectedPaths
+        ? Array.from(changedPathSet).filter((p) => !this.expectedPaths!.has(p)).sort()
+        : [];
+      const ownedChanged = this.expectedPaths
+        ? this.changed.filter((e) => [e.path, e.old_path].filter(Boolean).some((p) => this.expectedPaths!.has(p!)))
+        : this.changed;
+      const deleted = ownedChanged.filter((e) => e.status.includes("D"));
       const violations: string[] = [];
-      if (this.changed.length > this.maxChangedFiles) violations.push(`Git guard blast-radius violation: ${this.changed.length} files changed (limit ${this.maxChangedFiles})`);
+      if (unexpected.length) violations.push(`Git guard unexpected dirty path(s): ${unexpected.slice(0, 10).join(", ")}`);
+      if (ownedChanged.length > this.maxChangedFiles) violations.push(`Git guard blast-radius violation: ${ownedChanged.length} files changed (limit ${this.maxChangedFiles})`);
       if (deleted.length > this.maxDeletedFiles) violations.push(`Git guard delete violation: ${deleted.length} files deleted (limit ${this.maxDeletedFiles})`);
-      const pathspecs = Array.from(new Set(this.changed.flatMap((e) => [e.path, e.old_path]).filter(Boolean))).sort();
+      const pathspecs = Array.from(new Set(ownedChanged.flatMap((e) => [e.path, e.old_path]).filter(Boolean))).sort();
       if (violations.length) {
         this.violation = violations.join("; ");
         if (this.server.gitGuardMode !== "warn") {
@@ -106,6 +117,8 @@ export class GitTxn {
         }
         console.error(`[logseq-mcp] git guard warning: ${this.violation} ${JSON.stringify(this.payload())}`);
       }
+      this.changed = ownedChanged;
+      if (this.expectedPaths && pathspecs.length === 0) return;
       this.server.gitOk(["add", "-A", "--", ...pathspecs], 60000);
       const subject = `mcp-logseq: ${this.tool} ${this.txnId}`;
       const messageArgs = [
@@ -121,9 +134,12 @@ export class GitTxn {
         "-m",
         `before_head: ${this.beforeHead}`,
         "-m",
-        `changed_files: ${this.changed.length}`,
+        `changed_files: ${ownedChanged.length}`,
       ];
       if (this.violation) messageArgs.push("-m", `guard_violation: ${this.violation}`);
+      for (const [key, value] of Object.entries(this.metadata)) {
+        if (value) messageArgs.push("-m", `${key}: ${value}`);
+      }
       messageArgs.push("--", ...pathspecs);
       this.server.gitOk(messageArgs, 60000);
       this.commit = this.server.gitHead();

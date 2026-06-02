@@ -260,12 +260,25 @@ function updateInstructions(packageName: string, install: InstallMode, channel: 
 }
 
 function checkNodeVersion(range: string): { name: string; ok: boolean; detail: string } {
-  const minimum = range.match(/>=\s*(\d+)\.(\d+)\.(\d+)/);
-  if (!minimum) return { name: "node", ok: true, detail: process.version };
   const current = process.versions.node.split(".").map((part) => Number(part));
-  const expected = minimum.slice(1).map((part) => Number(part));
-  const ok = compareParts(current, expected) >= 0;
+  const ok = range.split("||").some((part) => nodeRangePartSatisfied(current, part.trim()));
   return { name: "node", ok, detail: `${process.version} required ${range}` };
+}
+
+function nodeRangePartSatisfied(current: number[], rangePart: string): boolean {
+  const wildcard = rangePart.match(/^(\d+)\.x$/);
+  if (wildcard) return current[0] === Number(wildcard[1]);
+  const minimumSameMajor = rangePart.match(/^\^\s*(\d+)\.(\d+)\.(\d+)$/);
+  if (minimumSameMajor) {
+    const expected = minimumSameMajor.slice(1).map((part) => Number(part));
+    return current[0] === expected[0] && compareParts(current, expected) >= 0;
+  }
+  const minimum = rangePart.match(/^>=\s*(\d+)\.(\d+)\.(\d+)$/);
+  if (minimum) {
+    const expected = minimum.slice(1).map((part) => Number(part));
+    return compareParts(current, expected) >= 0;
+  }
+  return false;
 }
 
 function checkPackageMetadata(packageJson: PackageInfo): { name: string; ok: boolean; detail: string } {

@@ -33,7 +33,14 @@ export type GraphNode = {
 export type ToolDefinition = {
   name: string;
   description: string;
+  annotations?: Record<string, unknown>;
   inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties?: boolean;
+  };
+  outputSchema?: {
     type: "object";
     properties: Record<string, unknown>;
     required?: string[];

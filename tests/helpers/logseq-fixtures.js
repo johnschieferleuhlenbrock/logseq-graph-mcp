@@ -50,6 +50,7 @@ export function server(root, env = {}) {
     env: {
       ...process.env,
       LOGSEQ_ROOT: root,
+      LOGSEQ_WRITE_MODE: "admin_raw",
       LOGSEQ_GIT_GUARD: "strict",
       LOGSEQ_VALIDATE_SCHEMA: "block",
       LOGSEQ_MAX_RESPONSE_BYTES: "500000",
