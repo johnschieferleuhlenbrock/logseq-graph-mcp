@@ -501,6 +501,34 @@ test("safe write intents require explicit flush ids and keep ledger out of git",
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("safe already-applied flush claims intent before completing", () => {
+  const root = makeGraph();
+  const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
+  const submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:already-applied-claims-first",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-01", content: "externally applied [[Alice]]" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  const journalPath = path.join(root, "journals", "2026_06_01.md");
+  fs.writeFileSync(journalPath, "- externally applied [[Alice]]\n", "utf8");
+  run("git", ["add", "-A"], root);
+  run("git", ["commit", "-q", "-m", "external journal append"], root);
+
+  const flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  assert.equal(flush.results[0].reconciled, true);
+  const intent = s.callTool("get_write_intent", { intent_id: submit.intent.intent_id }).intent;
+  assert.equal(intent.state, "completed");
+  assert.equal(intent.attempt_count, 1);
+  const journal = fs.readFileSync(journalPath, "utf8");
+  assert.equal((journal.match(/externally applied/g) ?? []).length, 1);
+  assert.equal(status(root), "");
+  s.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("safe write intent claims are atomic across repeated flush attempts", () => {
   const root = makeGraph();
   const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });

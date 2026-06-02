@@ -911,20 +911,6 @@ export class LogseqServer {
       return { ok: false, intent_id: record.op_id, state: next.state, error: next.last_error };
     }
     const args = JSON.parse(record.canonical_args_json) as Record<string, unknown>;
-    const already = this.intentAlreadyApplied(record.tool, args);
-    if (already.ok) {
-      const next = this.writeLedger.markCompleted(record, this.ok({ reconciled: true, already_applied: true, result: already }), null, true);
-      return { ok: true, intent_id: record.op_id, state: next.state, reconciled: true, intent: publicRecord(next) };
-    }
-    if (record.expected_base_head && this.gitInsideWorktree() && this.gitHead() !== record.expected_base_head) {
-      const next = this.writeLedger.markManual(record, "expected_base_head no longer matches graph HEAD", { current_head: this.gitHead() });
-      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
-    }
-    const precondition = this.checkIntentPreconditions(record);
-    if (!precondition.ok) {
-      const next = this.writeLedger.markManual(record, String(precondition.error), precondition);
-      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
-    }
     const claim = this.writeLedger.claimForFlush(record, SERVER_WRITE_DEADLINE_MS);
     if (!claim.claimed) {
       const latest = claim.record;
@@ -932,6 +918,20 @@ export class LogseqServer {
       return { ok: false, intent_id: latest.op_id, state: latest.state, error: `write intent is already ${latest.state}` };
     }
     let applying = claim.record;
+    const already = this.intentAlreadyApplied(record.tool, args);
+    if (already.ok) {
+      const next = this.writeLedger.markCompleted(applying, this.ok({ reconciled: true, already_applied: true, result: already }), null, true);
+      return { ok: true, intent_id: record.op_id, state: next.state, reconciled: true, intent: publicRecord(next) };
+    }
+    if (record.expected_base_head && this.gitInsideWorktree() && this.gitHead() !== record.expected_base_head) {
+      const next = this.writeLedger.markManual(applying, "expected_base_head no longer matches graph HEAD", { current_head: this.gitHead() });
+      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
+    }
+    const precondition = this.checkIntentPreconditions(record);
+    if (!precondition.ok) {
+      const next = this.writeLedger.markManual(applying, String(precondition.error), precondition);
+      return { ok: false, intent_id: record.op_id, state: next.state, error: next.manual_reason };
+    }
     const effectsBefore = this.writeLedger.effects(record.op_id);
     this.activeWriteIntent = { op_id: record.op_id, idempotency_key: record.idempotency_key, request_hash: record.request_hash, expected_paths: this.intentExpectedPaths(record, effectsBefore), effects: effectsBefore };
     let result: ToolResult;
