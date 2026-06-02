@@ -404,7 +404,7 @@ test("safe contact log idempotency is scoped to the contact log section", () => 
 test("safe append idempotency is scoped to body anchors and journal sections", () => {
   const root = makeGraph();
   writePage(root, "Scoped Body", "type:: note\n\n- Other\n\t- duplicate line\n- Target\n\t- existing\n");
-  fs.writeFileSync(path.join(root, "journals", "2026_06_03.md"), "- ## Other\n\t- duplicate bullet\n- ## duplicate top bullet\n- ## Target\n\t- existing\n", "utf8");
+  fs.writeFileSync(path.join(root, "journals", "2026_06_03.md"), "- ## Other\n\t- duplicate bullet\n- ## duplicate top bullet\n- ## Target\n\t- existing\n\t- callback\n", "utf8");
   run("git", ["add", "-A"], root);
   run("git", ["commit", "-q", "-m", "add scoped idempotency fixtures"], root);
   const s = new LogseqServer({ root, env: { ...process.env, LOGSEQ_ROOT: root, LOGSEQ_GIT_GUARD: "strict", LOGSEQ_WATCH: "0" } });
@@ -444,6 +444,18 @@ test("safe append idempotency is scoped to body anchors and journal sections", (
   assert.equal(flush.results[0].ok, true);
   journal = s.read_journal("2026-06-03");
   assert.match(journal.raw, /\n- duplicate top bullet\n?$/);
+
+  submit = s.callTool("submit_write_intent", {
+    idempotency_key: "test:journal-section-prefix-is-not-applied",
+    tool: "append_journal_bullet",
+    arguments: { date: "2026-06-03", section: "Target", content: "call" },
+    caller: "test",
+  });
+  assert.equal(submit.ok, true);
+  flush = s.callTool("flush_write_intents", { intent_ids: [submit.intent.intent_id] });
+  assert.equal(flush.results[0].ok, true);
+  journal = s.read_journal("2026-06-03");
+  assert.match(journal.raw, /- ## Target\n\t- call\n\t- duplicate bullet\n\t- existing\n\t- callback/);
   assert.equal(status(root), "");
   s.close();
   fs.rmSync(root, { recursive: true, force: true });

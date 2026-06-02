@@ -1255,7 +1255,8 @@ export class LogseqServer {
     const after = text.slice(m.index + m[0].length);
     const nextSection = after.search(/\n- ## /);
     const sectionText = nextSection >= 0 ? after.slice(0, nextSection) : after;
-    return sectionText.includes(`\t- ${marker}`);
+    const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^\t- ${escapedMarker}\\s*$`, "m").test(sectionText);
   }
 
   private contactLogAlreadyApplied(p: string, args: Record<string, unknown>): boolean {
